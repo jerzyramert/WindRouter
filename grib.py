@@ -216,9 +216,9 @@ def generate_reachable_graph(cache, safe_points_map, start_lat, start_lon, targe
     
     return [safe_points_map[node] for node in reachable_nodes]
 
-def simulate_vmg_route(weather_cache, start_lat=53.25, start_lon=2.6, time_step_min=30.0):
+def simulate_vmg_route(weather_cache, start_lat=53.25, start_lon=2.6, time_step_min=10.0):
     """
-    Symuluje trasę optymalizując VMG.
+    Symuluje trasę optymalizując VMG. Limit kroków: 10 000.
     """
     if not weather_cache: return []
     lats, lons = weather_cache['lats'], weather_cache['lons']
@@ -233,9 +233,10 @@ def simulate_vmg_route(weather_cache, start_lat=53.25, start_lon=2.6, time_step_
     route_points = []
     step_count, total_dist_nm = 0, 0.0
 
-    print(f"{'Krok':<4} | {'Czas_SIM':<8} | {'Lat':<8} | {'Lon':<8} | {'TWS[kt]':<7} | {'Hdg[°]':<7} | {'BS[kt]':<6} | {'VMG[kt]':<7} | {'A':<2}")
-    print("-" * 110)
+    print(f"{'Krok':<5} | {'Czas_SIM':<8} | {'Lat':<8} | {'Lon':<8} | {'TWS[kt]':<7} | {'Hdg[°]':<7} | {'BS[kt]':<6} | {'VMG[kt]':<7} | {'A':<2}")
+    print("-" * 115)
 
+    # Limit kroków ustawiony na 10000
     while curr_lat < target_lat:
         weather = get_weather_from_cache(weather_cache, curr_lat, curr_lon, current_time)
         if not weather: break
@@ -259,16 +260,59 @@ def simulate_vmg_route(weather_cache, start_lat=53.25, start_lon=2.6, time_step_
         route_points.append({'lat': curr_lat, 'lon': curr_lon, 'time': current_time})
         
         approx = "*" if weather['meta']['approximated'] else " "
-        print(f"{step_count:<4} | {current_time.strftime('%H:%M:%S'):<8} | {curr_lat:<8.4f} | {curr_lon:<8.4f} | {tws:<7.2f} | {best_hdg:<7.0f} | {best_bs:<6.2f} | {best_vmg:<7.2f} | {approx:<2}")
+        if step_count % 10 == 0: # Wyświetlanie co 10 kroku przy dużym limicie
+            print(f"{step_count:<5} | {current_time.strftime('%H:%M:%S'):<8} | {curr_lat:<8.4f} | {curr_lon:<8.4f} | {tws:<7.2f} | {best_hdg:<7.0f} | {best_bs:<6.2f} | {best_vmg:<7.2f} | {approx:<2}")
         
         curr_lat += (dist_nm * math.cos(math.radians(best_hdg))) / 60.0
         curr_lon += (dist_nm * math.sin(math.radians(best_hdg))) / (60.0 * math.cos(math.radians(curr_lat)))
         current_time += timedelta(minutes=time_step_min)
         step_count += 1
-        if step_count > 500 or not (lons.min() <= curr_lon <= lons.max()): break
+        if step_count >= 10000 or not (lons.min() <= curr_lon <= lons.max()): break
 
-    print("-" * 110)
-    print(f"Koniec VMG: Dystans {total_dist_nm:.2f} nm.")
+    print("-" * 115)
+    print(f"Koniec VMG: Dystans {total_dist_nm:.2f} nm, Liczba kroków: {step_count}.")
+    return route_points
+
+def simulate_manual_route(weather_cache, target_heading=45, start_lat=53.25, start_lon=2.6, time_step_min=10.0):
+    """
+    Symulacja manualna. Limit kroków: 10 000.
+    """
+    if not weather_cache: return []
+    lats, lons = weather_cache['lats'], weather_cache['lons']
+    curr_lat, curr_lon = start_lat, start_lon
+    
+    print(f"\n--- SYMULACJA MANUALNA (Kurs: {target_heading}°) ---")
+    polars = get_scampi_30_polars()
+    current_time = datetime.now().replace(second=0, microsecond=0)
+    route_points = []
+    step_count, total_dist_nm = 0, 0.0
+
+    while lats.min() <= curr_lat <= lats.max() and lons.min() <= curr_lon <= lons.max():
+        weather = get_weather_from_cache(weather_cache, curr_lat, curr_lon, current_time)
+        if not weather: break
+        
+        u, v = weather['wind_u'], weather['wind_v']
+        tws = np.sqrt(u**2 + v**2) * 1.94384
+        twd = (math.degrees(math.atan2(-u, -v)) + 360) % 360
+        twa = abs(((twd - target_heading + 180) % 360) - 180)
+        
+        actual_hdg = target_heading
+        if twa < 45: # Korekta strefy martwej
+            h1, h2 = (twd + 45) % 360, (twd - 45) % 360
+            actual_hdg = h1 if abs(h1-target_heading) < abs(h2-target_heading) else h2
+            twa = 45.0
+
+        b_speed = polars([twa, tws])[0]
+        dist_nm = b_speed * (time_step_min / 60.0)
+        total_dist_nm += dist_nm
+        route_points.append({'lat': curr_lat, 'lon': curr_lon, 'time': current_time})
+        
+        curr_lat += (dist_nm * math.cos(math.radians(actual_hdg))) / 60.0
+        curr_lon += (dist_nm * math.sin(math.radians(actual_hdg))) / (60.0 * math.cos(math.radians(curr_lat)))
+        current_time += timedelta(minutes=time_step_min)
+        step_count += 1
+        if step_count >= 10000: break
+    
     return route_points
 
 def save_danger_zones_to_gpx(points, filename, layer_name, symbol="Danger Area"):
@@ -330,8 +374,8 @@ if __name__ == "__main__":
         with open("reachable_safe_points.gpx", "w") as f: f.write('\n'.join(header_safe + body_safe + ['</gpx>']))
         print(f"[SUKCES] Zapisano {len(reachable)} punktów osiągalnych.")
 
-        # 3. Symulacja trasy
-        vmg_pts = simulate_vmg_route(weather_cache, start_lat, start_lon, time_step_min=0.0)
+        # 3. Symulacja trasy (Time step: 10 min, Max steps: 10000)
+        vmg_pts = simulate_vmg_route(weather_cache, start_lat, start_lon, time_step_min=10.0)
         if vmg_pts:
             save_to_gpx(vmg_pts, "scampi_vmg.gpx")
     else:

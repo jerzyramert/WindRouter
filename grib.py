@@ -301,7 +301,7 @@ def analyze_grib_performance(file_path):
         print(f"Diagnostic error: {e}")
 
 if __name__ == "__main__":
-    file_name = "aaa.grb2"
+    file_name = "test.grb2"
     analyze_grib_performance(file_name)
     
     # Example call for VMG Optimization simulation

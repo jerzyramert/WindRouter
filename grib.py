@@ -163,7 +163,7 @@ def identify_safe_sailing_areas(cache, max_wind_threshold=30.0):
 
 def generate_reachable_graph(cache, safe_points_map, start_lat, start_lon, target_lat, target_lon, start_time, log_file="graph_log.txt"):
     """
-    Builds a connection graph between safe grid points for a specific departure time.
+    Builds a connection graph between safe grid points for a specific departure time (Static snapshot).
     """
     if not safe_points_map:
         return set(), {}, None
@@ -196,7 +196,7 @@ def generate_reachable_graph(cache, safe_points_map, start_lat, start_lon, targe
             curr_p = safe_points_map[(r, c)]
             bearing_to_target = calculate_bearing(curr_p['lat'], curr_p['lon'], target_lat, target_lon)
             
-            # Fetch weather for the specific departure moment (start_time)
+            # Static snapshot for Dijkstra 2D
             weather = get_weather_from_cache(cache, curr_p['lat'], curr_p['lon'], start_time)
             u, v = weather['wind_u'], weather['wind_v']
             tws = np.sqrt(u**2 + v**2) * 1.94384
@@ -238,11 +238,10 @@ def generate_reachable_graph(cache, safe_points_map, start_lat, start_lon, targe
 
 def find_shortest_path_dijkstra(start_node, adjacency_map, safe_points_map, target_lat, target_lon):
     """
-    Searches for the fastest route in the generated graph to the node closest to the target coordinates.
+    Static Dijkstra: Searches for the fastest route in the pre-built graph.
     """
     if not start_node or not adjacency_map: return [], 0
     
-    # 1. Calculate travel costs for all reachable nodes
     distances = {node: float('inf') for node in adjacency_map.keys()}
     distances[start_node] = 0
     predecessors = {node: None for node in adjacency_map.keys()}
@@ -262,28 +261,110 @@ def find_shortest_path_dijkstra(start_node, adjacency_map, safe_points_map, targ
                     distances[neighbor], predecessors[neighbor] = dist, curr_node
                     heapq.heappush(pq, (dist, neighbor))
                 
-    # 2. Select the target node (geographically closest to specified target)
     reachable_and_visited = [n for n in adjacency_map.keys() if distances[n] != float('inf')]
     if not reachable_and_visited: 
-        print("[DIJKSTRA DIAG] ERROR: No reachable nodes found.")
         return [], 0
     
-    # Search for the node in graph physically closest to target_lat, target_lon
     best_finish = min(reachable_and_visited, key=lambda n: calculate_distance_nm(
         safe_points_map[n]['lat'], safe_points_map[n]['lon'], target_lat, target_lon))
     
     total_cost = distances[best_finish]
-    target_node_lat = safe_points_map[best_finish]['lat']
-    target_node_lon = safe_points_map[best_finish]['lon']
-    
-    print(f"[DIJKSTRA DIAG] Route target: {target_node_lat:.4f}N, {target_node_lon:.4f}E | Cost: {total_cost:.2f} h")
-
-    # 3. Path reconstruction
     path = []
     curr = best_finish
     while curr is not None:
         path.append(safe_points_map[curr]); curr = predecessors[curr]
     return path[::-1], total_cost
+
+def find_shortest_path_dijkstra_3d(start_node, safe_points_map, target_lat, target_lon, start_time, cache):
+    """
+    Dijkstra3D (Time-Dependent): Builds and searches the graph simultaneously while
+    accounting for changing weather forecast at every node expansion.
+    """
+    if not start_node or not safe_points_map: return [], 0
+    
+    polars = get_scampi_30_polars()
+    
+    # State: total_cost_hours, (r, c)
+    pq = [(0, start_node)]
+    distances = {start_node: 0}
+    predecessors = {start_node: None}
+    
+    nodes_visited = 0
+    best_finish_node = None
+    min_dist_to_target = float('inf')
+    
+    # Target bearing for angle filtering (relative to global destination)
+    # We use a fixed target bearing from start for consistency in the search cone
+    start_lat_val, start_lon_val = safe_points_map[start_node]['lat'], safe_points_map[start_node]['lon']
+    
+    while pq:
+        curr_cost, curr_node = heapq.heappop(pq)
+        nodes_visited += 1
+        
+        if curr_cost > distances.get(curr_node, float('inf')):
+            continue
+            
+        curr_p = safe_points_map[curr_node]
+        dist_to_target = calculate_distance_nm(curr_p['lat'], curr_p['lon'], target_lat, target_lon)
+        
+        if dist_to_target < min_dist_to_target:
+            min_dist_to_target = dist_to_target
+            best_finish_node = curr_node
+            
+        if dist_to_target < 1.0: # Close enough to target
+            break
+            
+        # Get dynamic weather for current node at current voyage time
+        curr_voyage_time = start_time + timedelta(hours=curr_cost)
+        weather = get_weather_from_cache(cache, curr_p['lat'], curr_p['lon'], curr_voyage_time)
+        u, v = weather['wind_u'], weather['wind_v']
+        tws = np.sqrt(u**2 + v**2) * 1.94384
+        twd = (math.degrees(math.atan2(-u, -v)) + 360) % 360
+        
+        bearing_to_final_target = calculate_bearing(curr_p['lat'], curr_p['lon'], target_lat, target_lon)
+        
+        r, c = curr_node
+        for dr in [-1, 0, 1]:
+            for dc in [-1, 0, 1]:
+                if dr == 0 and dc == 0: continue
+                neighbor = (r + dr, c + dc)
+                
+                if neighbor in safe_points_map:
+                    n_p = safe_points_map[neighbor]
+                    bearing_to_neighbor = calculate_bearing(curr_p['lat'], curr_p['lon'], n_p['lat'], n_p['lon'])
+                    
+                    # Angle filter: ±80 degrees
+                    angle_diff = abs(((bearing_to_neighbor - bearing_to_final_target + 180) % 360) - 180)
+                    if angle_diff > 80.0: continue
+                    
+                    dist = calculate_distance_nm(curr_p['lat'], curr_p['lon'], n_p['lat'], n_p['lon'])
+                    twa = abs(((twd - bearing_to_neighbor + 180) % 360) - 180)
+                    
+                    if twa < 32: continue # Dead zone
+                    
+                    bs = polars([twa, tws])[0]
+                    if bs <= 0: continue
+                    
+                    edge_cost = dist / bs
+                    new_dist = curr_cost + edge_cost
+                    
+                    if new_dist < distances.get(neighbor, float('inf')):
+                        distances[neighbor] = new_dist
+                        predecessors[neighbor] = curr_node
+                        heapq.heappush(pq, (new_dist, neighbor))
+
+    if not best_finish_node: return [], 0
+    
+    path = []
+    curr = best_finish_node
+    while curr is not None:
+        path_point = safe_points_map[curr].copy()
+        path_point['time'] = start_time + timedelta(hours=distances[curr])
+        path.append(path_point)
+        curr = predecessors[curr]
+        
+    print(f"[DIJKSTRA 3D] Search complete. Visited: {nodes_visited} | Final cost: {distances[best_finish_node]:.2f} h")
+    return path[::-1], distances[best_finish_node]
 
 def save_route_detailed_log(points, cache, filename, label):
     """
@@ -306,23 +387,17 @@ def save_route_detailed_log(points, cache, filename, label):
             lat, lon = p['lat'], p['lon']
             time = p.get('time', datetime.now())
             
-            # Fetch weather
             w = get_weather_from_cache(cache, lat, lon, time)
             u, v = w['wind_u'], w['wind_v']
             tws = np.sqrt(u**2 + v**2) * 1.94384
             twd = (math.degrees(math.atan2(-u, -v)) + 360) % 360
             
-            # Heading - bearing to the next point
             if i < len(points) - 1:
                 hdg = calculate_bearing(lat, lon, points[i+1]['lat'], points[i+1]['lon'])
             else:
-                # Last point - keep heading from the previous step
                 hdg = calculate_bearing(points[i-1]['lat'], points[i-1]['lon'], lat, lon) if i > 0 else 0
             
-            # TWA (True Wind Angle)
             twa = abs(((twd - hdg + 180) % 360) - 180)
-            
-            # Boat Speed (BS) from polars
             bs = polars([max(32, twa), tws])[0] if twa >= 32 else 0
             
             row = f"{time.strftime('%Y-%m-%d %H:%M'):<20} | {lat:<10.6f} | {lon:<10.6f} | {tws:<8.2f} | {twd:<8.1f} | {hdg:<11.1f} | {twa:<8.1f} | {bs:<8.2f}\n"
@@ -352,7 +427,7 @@ def save_graph_to_json(reachable_nodes, adjacency_map, safe_points_map, filename
 
 def simulate_vmg_route(cache, start_lat, start_lon, target_lat, target_lon, start_time, time_step_min=10.0):
     """
-    VMG routing based on True Wind Speed (TWS) with dynamic start time.
+    VMG routing based on True Wind Speed (TWS) with dynamic start time (Dynamic weather).
     """
     if not cache: return []
     lats, lons = cache['lats'], cache['lons']
@@ -362,7 +437,6 @@ def simulate_vmg_route(cache, start_lat, start_lon, target_lat, target_lon, star
     curr_lat, curr_lon = start_lat, start_lon
     polars = get_scampi_30_polars()
     
-    # Initialize simulation time from the given start_time
     curr_time = start_time
     route_points = []
     step = 0
@@ -383,10 +457,9 @@ def simulate_vmg_route(cache, start_lat, start_lon, target_lat, target_lon, star
         best_hdg = None
         best_bs = 0
         
-        # Scan headings every 2 degrees
         for h in range(0, 360, 2):
             twa = abs(((twd - h + 180) % 360) - 180)
-            if twa < 32: continue # Dead zone
+            if twa < 32: continue 
             
             v_boat = polars([twa, tws])[0]
             dist_step = v_boat * (time_step_min / 60.0)
@@ -425,7 +498,8 @@ def save_to_gpx(points, filename, label="Route"):
     """Saves the route track to a GPX file."""
     header = ['<?xml version="1.0" encoding="UTF-8"?>', f'<gpx version="1.1" creator="ScampiRouter" xmlns="http://www.topografix.com/GPX/1/1"><trk><name>{label}</name><trkseg>']
     body = [f'  <trkpt lat="{p["lat"]:.6f}" lon="{p["lon"]:.6f}">' + (f"<time>{p['time'].strftime('%Y-%m-%dT%H:%M:%SZ')}</time>" if 'time' in p else "") + '</trkpt>' for p in points]
-    with open(filename, 'w', encoding='utf-8') as f: f.write('\n'.join(header + body + ['</trkseg></trk></gpx>']))
+    footer = ['</trkseg></trk></gpx>']
+    with open(filename, 'w', encoding='utf-8') as f: f.write('\n'.join(header + body + footer))
 
 def analyze_grib_performance(file_path):
     """GRIB file diagnostics."""
@@ -446,17 +520,13 @@ if __name__ == "__main__":
         lats, lons = weather_cache['lats'], weather_cache['lons']
         start_lat, start_lon = 53.25, 2.6
         
-        # DEFINITION OF SHARED TARGET FOR BOTH ALGORITHMS
         target_lat = lats.max()
         target_lon = (lons.min() + lons.max()) / 2.0
         
-        # Initialize first departure time from GRIB file
         base_start_time = weather_cache['dates'][0]
         
-        # Clear log before starting
         if os.path.exists("graph_log.txt"): os.remove("graph_log.txt")
 
-        # 1. Identify danger zones and safe areas
         save_to_gpx(identify_weather_danger_zones(weather_cache, 40.0), "forbidden_areas.gpx", "Wind >40kt")
         save_to_gpx(identify_weather_danger_zones(weather_cache, 30.0, 40.0), "caution_areas.gpx", "Wind 30-40kt")
         safe_map = identify_safe_sailing_areas(weather_cache, 30.0)
@@ -467,31 +537,29 @@ if __name__ == "__main__":
             current_departure_time = base_start_time + timedelta(hours=(i-1)*5)
             print(f"\n>>> SIMULATION NO {i} (Departure: {current_departure_time.strftime('%Y-%m-%d %H:%M')}) <<<")
             
-            # --- DIJKSTRA ALGORITHM ---
+            # --- DIJKSTRA 2D (STATIC SNAPSHOT) ---
             nodes, adj, start_idx = generate_reachable_graph(weather_cache, safe_map, start_lat, start_lon, target_lat, target_lon, current_departure_time)
-            
             if nodes:
-                fastest_path, d_cost = find_shortest_path_dijkstra(start_idx, adj, safe_map, target_lat, target_lon)
-                if fastest_path:
-                    # Add time to Dijkstra points
-                    for idx, p in enumerate(fastest_path):
-                        p['time'] = current_departure_time + timedelta(hours=(idx * d_cost / len(fastest_path)))
-                    
-                    filename_d_gpx = f"fastest_path_start_{i}.gpx"
-                    filename_d_log = f"log_dijkstra_start_{i}.txt"
-                    
-                    save_to_gpx(fastest_path, filename_d_gpx, f"Dijkstra Route {i}")
-                    save_route_detailed_log(fastest_path, weather_cache, filename_d_log, f"Dijkstra Route {i}")
-                    print_route_summary(fastest_path, f"DIJKSTRA (START {i})", d_cost)
-            
-            # --- VMG ALGORITHM ---
+                fastest_path_2d, d_cost_2d = find_shortest_path_dijkstra(start_idx, adj, safe_map, target_lat, target_lon)
+                if fastest_path_2d:
+                    for idx, p in enumerate(fastest_path_2d):
+                        p['time'] = current_departure_time + timedelta(hours=(idx * d_cost_2d / len(fastest_path_2d)))
+                    save_to_gpx(fastest_path_2d, f"fastest_path_start_{i}.gpx", f"Dijkstra 2D Route {i}")
+                    save_route_detailed_log(fastest_path_2d, weather_cache, f"log_dijkstra_start_{i}.txt", f"Dijkstra 2D Route {i}")
+                    print_route_summary(fastest_path_2d, f"DIJKSTRA 2D (START {i})", d_cost_2d)
+
+            # --- DIJKSTRA 3D (DYNAMIC WEATHER) ---
+            fastest_path_3d, d_cost_3d = find_shortest_path_dijkstra_3d(start_idx, safe_map, target_lat, target_lon, current_departure_time, weather_cache)
+            if fastest_path_3d:
+                save_to_gpx(fastest_path_3d, f"fastest_path_3d_start_{i}.gpx", f"Dijkstra 3D Route {i}")
+                save_route_detailed_log(fastest_path_3d, weather_cache, f"log_dijkstra_3d_start_{i}.txt", f"Dijkstra 3D Route {i}")
+                print_route_summary(fastest_path_3d, f"DIJKSTRA 3D (START {i})", d_cost_3d)
+
+            # --- VMG ALGORITHM (DYNAMIC WEATHER) ---
             vmg_pts = simulate_vmg_route(weather_cache, start_lat, start_lon, target_lat, target_lon, current_departure_time, 10.0)
             if vmg_pts:
-                filename_v_gpx = f"scampi_vmg_start_{i}.gpx"
-                filename_v_log = f"log_vmg_start_{i}.txt"
-                
-                save_to_gpx(vmg_pts, filename_v_gpx, f"VMG Route {i}")
-                save_route_detailed_log(vmg_pts, weather_cache, filename_v_log, f"VMG Route {i}")
+                save_to_gpx(vmg_pts, f"scampi_vmg_start_{i}.gpx", f"VMG Route {i}")
+                save_route_detailed_log(vmg_pts, weather_cache, f"log_vmg_start_{i}.txt", f"VMG Route {i}")
                 print_route_summary(vmg_pts, f"VMG (START {i})")
 
         print("\nSimulations complete. Generated GPX files and detailed TXT logs.")

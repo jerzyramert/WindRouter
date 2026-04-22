@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<gpx version="1.1" creator="ScampiRouter" xmlns="http://www.topografix.com/GPX/1/1"><trk><name>Dijkstra Route 1</name><trkseg>
+<gpx version="1.1" creator="ScampiRouter" xmlns="http://www.topografix.com/GPX/1/1"><trk><name>Dijkstra 2D Route 1</name><trkseg>
   <trkpt lat="53.250000" lon="2.500000"><time>2026-04-21T12:00:00Z</time></trkpt>
   <trkpt lat="53.500000" lon="2.250000"><time>2026-04-21T14:32:59Z</time></trkpt>
   <trkpt lat="53.750000" lon="2.000000"><time>2026-04-21T17:05:58Z</time></trkpt>

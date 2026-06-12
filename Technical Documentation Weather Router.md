@@ -1,90 +1,153 @@
-# **Technical Documentation: Scampi 30 GRIB Router & Performance Analyzer**
+# Technical Documentation: Scampi 30 GRIB Router & Performance Analyzer
 
-This document provides a comprehensive overview of the technical implementation, architectural logic, and functional specification of the yacht\_performance\_grib.py routing engine. It is intended for developers maintaining or extending the codebase.
+This document describes the technical implementation of the `grib.py` routing engine and the `Visualiser.py` map viewer. It is intended for developers maintaining or extending the codebase.
 
-## **1\. System Architecture**
+For the full bug list and refactoring roadmap see `REQUIREMENTS.md` and `REFACTORING_PLAN.md`.
+
+---
+
+## 1. System Architecture
 
 The application follows a linear processing pipeline:
 
-1. **Data Ingestion**: Loading GRIB2 meteorological data into a RAM-based cache.  
-2. **Performance Modeling**: Initializing 2D interpolation for yacht-specific polar curves.  
-3. **Spatial Analysis**: Identifying "safe zones" where True Wind Speed (TWS) remains below defined safety thresholds (30 kt).  
-4. **Routing Engines**:  
-   * **Dijkstra (Graph-based)**: Global optimization for the fastest route across a pre-calculated reachable graph.  
-   * **VMG (Vector-based)**: Iterative greedy optimization aiming for the best velocity made good towards a specific target.  
-5. **Audit & Export**: Generating detailed TXT logs and GPX tracks for external validation.
+1. **Data Ingestion** — `load_grib_to_memory`: parses a GRIB2 file once into a RAM cache.
+2. **Performance Modelling** — `get_scampi_30_polars`: initialises a 2D interpolator for the Scampi 30 polar table (TWA × TWS → Boat Speed).
+3. **Spatial Analysis** — `identify_safe_sailing_areas` / `identify_weather_danger_zones`: classifies grid cells by TWS threshold across the full forecast window.
+4. **Routing engines** (three independent implementations):
+   - **Dijkstra 2D** (`find_shortest_path_dijkstra`): shortest path on a static weather snapshot at departure time. Fast, ignores time evolution.
+   - **Dijkstra 3D** (`find_shortest_path_dijkstra_3d`): time-aware Dijkstra; weather is re-sampled at each node based on accumulated elapsed time. Slower but more accurate on long passages.
+   - **VMG simulation** (`simulate_vmg_route`): greedy iterative solver; scans all headings every 10 minutes and picks the best VMG towards the target.
+5. **Export** — `save_route_detailed_log`, `save_to_gpx`, `save_graph_to_json`: TXT log, GPX track, and JSON graph for the Visualiser.
 
-## **2\. Core Components & Logic**
+---
 
-### **2.1 Weather Data Handling**
+## 2. Core Components
 
-* **True Wind Calculation**: The GRIB U and V components (10m above ground) are treated as **True Wind Speed (TWS)** and **True Wind Direction (TWD)** relative to the ground.  
-* **Caching**: load\_grib\_to\_memory parses the file once and stores data in a nested dictionary weather\_cache\[date\]\[parameter\]. This significantly reduces I/O overhead during graph construction and simulation.
+### 2.1 Weather Data Handling
 
-### **2.2 Yacht Performance (Polars)**
+**Cache structure** returned by `load_grib_to_memory`:
 
-* **Interpolation**: The system uses scipy.interpolate.RegularGridInterpolator. It performs a linear 2D lookup: (TWA, TWS) \-\> Boat Speed.  
-* **Dead Zone**: A hard constraint is applied: if the True Wind Angle (TWA) is less than **32°**, the Boat Speed (BS) is forced to 0 (or a high penalty cost in graphs).
+```python
+{
+    "data":  {datetime: {"10 metre U wind component": np.ndarray,
+                         "10 metre v wind component": np.ndarray}},
+    "dates": [datetime, ...],   # sorted ascending
+    "lats":  np.ndarray,        # 2-D grid
+    "lons":  np.ndarray,
+}
+```
 
-### **2.3 Reachable Graph Logic (Dijkstra)**
+`get_weather_from_cache` finds the nearest grid point by minimum Euclidean distance (no interpolation) and the nearest date. Sets `meta["approximated"] = True` when the requested time falls outside the forecast window.
 
-The graph is built dynamically for each departure time using a Breadth-First Search (BFS) pattern:
+**V-component key**: GRIB files from different sources use `"10 metre v wind component"` (lowercase v) or `"10 metre V wind component"` (uppercase V). The code checks both. There is no equivalent fallback for the U-component (B-22).
 
-* **Safe Points**: Only points where TWS never exceeds 30kt throughout the forecast are considered.  
-* **Angle Filtering**: To ensure progress towards the target, a neighbor is only connected if the bearing to it is within **±80°** of the bearing to the final target.  
-* **Cost Calculation**: Cost \= Distance / Boat Speed. The cost is measured in hours.
+### 2.2 Yacht Performance (Polars)
 
-### **2.4 VMG Simulation Logic**
+`get_scampi_30_polars` returns a `scipy.interpolate.RegularGridInterpolator` fitted to the Scampi 30 polar table. Lookup: `polars([TWA, TWS])` → Boat Speed in knots.
 
-The VMG algorithm is an iterative solver:
+**Dead zone**: TWA < 32° → BS forced to 0. In Dijkstra 2D the cost is set to `9999` hours instead of skipping the edge entirely. In Dijkstra 3D and VMG the edge/heading is skipped (`continue`).
 
-1. **Heading Scan**: Every 2° (0-358), it calculates the potential Boat Speed.  
-2. **VMG Calculation**: VMG \= BS \* cos(Heading \- BearingToTarget).  
-3. **Boundary Protection**: Before committing to a heading, the algorithm predicts the next\_lat/lon. If the new position is outside the GRIB grid, the heading is discarded. This forces the yacht to tack/gybe inside the map.
+**Note**: `get_scampi_30_polars` constructs a new interpolator on every call — there is no memoization (C-16).
 
-## **3\. Function Reference**
+### 2.3 Reachable Graph (Dijkstra 2D & 3D)
 
-### **Utility & Math**
+`generate_reachable_graph` builds the adjacency map with BFS:
 
-* calculate\_bearing(lat1, lon1, lat2, lon2): Uses spherical trigonometry to find the initial bearing.  
-* calculate\_distance\_nm(lat1, lon1, lat2, lon2): Uses a simplified Haversine/Spherical model for distance in nautical miles.
+- **Safe points only**: cells where TWS never exceeds the threshold across all forecast times.
+- **Angle filter**: a neighbour is connected only if the bearing to it is within ±80° of the bearing to the final target (ensures forward progress).
+- **Cost**: `distance_nm / boat_speed_kt` in hours.
 
-### **Data Processing**
+**Known issue — B-24**: `distances` and `predecessors` are pre-seeded only from `adjacency_map.keys()`. Leaf nodes that appear only as edge targets (not as source keys) raise `KeyError` during relaxation.
 
-* load\_grib\_to\_memory(file\_path): Entry point for data. Returns a cache object.  
-* get\_weather\_from\_cache(cache, lat, lon, time): Finds the spatially and temporally nearest weather data point.  
-* identify\_safe\_sailing\_areas(cache, max\_wind\_threshold): Filters the GRIB grid based on a TWS safety limit.
+**Known issue — B-25**: Dijkstra 2D timestamps are distributed linearly (`idx / len * total_cost`) instead of accumulated from edge costs — every timestamp in the GPX and log is wrong.
 
-### **Routing & Algorithms**
+### 2.4 VMG Simulation
 
-* generate\_reachable\_graph(...): Constructs the adjacency map. Logs reasons for node rejection (Angle, Safety, Dead Zone) to graph\_log.txt.  
-* find\_shortest\_path\_dijkstra(...): Implementation of the shortest path algorithm on the adjacency map.  
-* simulate\_vmg\_route(...): Greedy simulator. Includes target-seeking logic and map boundary guards.
+Iterative greedy solver in `simulate_vmg_route`:
 
-### **Logging & Output**
+1. **Heading scan**: every 2° from 0–358°, compute potential BS from polars.
+2. **VMG**: `VMG = BS × cos(heading − bearing_to_target)`. Best heading = max VMG.
+3. **Boundary guard**: predicted next position is checked against the GRIB grid extent; out-of-bounds headings are discarded.
+4. **Termination**: within 1 nm of target, or 10 000 steps reached.
 
-* save\_route\_detailed\_log(...): Produces a human-readable table (TXT) containing: Time, Position, TWS, TWD, Heading, TWA, and Boat Speed.  
-* save\_to\_gpx(...): Standard GPX 1.1 track generation.
+**Known issue — B-04**: loop condition `while curr_lat < target_lat` hard-codes a northward destination. Any southbound or same-latitude target produces an empty route immediately.
 
-## **4\. Maintenance Notes for Developers**
+**Known issue — B-20**: the longitude update uses `cos(new_lat)` (after the latitude has already been incremented) instead of `cos(old_lat)`.
 
-### **Adjusting Safety Thresholds**
+---
 
-The safety limit is currently set to **30 knots**. To change this, modify the call to identify\_safe\_sailing\_areas in the \_\_main\_\_ block.
+## 3. Function Reference
 
-### **Changing the Target**
+### Utility
 
-The target is calculated in the main block. Currently, it is the northern edge of the GRIB file at the longitudinal center. To change to a specific coordinate, update target\_lat and target\_lon.
+| Function | Description |
+|---|---|
+| `calculate_bearing(lat1, lon1, lat2, lon2)` | Initial bearing using spherical trigonometry. Returns 0–360°. Returns 0 for identical points (B-06, no guard). |
+| `calculate_distance_nm(lat1, lon1, lat2, lon2)` | Flat-earth formula with cos(avg\_lat) correction. Accurate to ~0.1% for short distances at mid-latitudes; breaks at the antimeridian (B-21). |
 
-### **Performance Optimization**
+### Data Processing
 
-If the graph construction is slow:
+| Function | Description |
+|---|---|
+| `load_grib_to_memory(file_path)` | Parses GRIB2, returns cache dict or `None` on error. `grbs.close()` is not in a `finally` block — file handle leaks on exception (B-18). |
+| `get_weather_from_cache(cache, lat, lon, time)` | Nearest-neighbour lookup. Returns `None` for falsy cache. |
+| `identify_safe_sailing_areas(cache, max_wind_threshold=30)` | Returns `{(row, col): {lat, lon, max_speed}}` for cells safe across all timesteps. |
+| `identify_weather_danger_zones(cache, min_threshold, max_threshold=inf)` | Returns list of `{lat, lon, speed, time}` for cells that exceeded the threshold. Records first exceedance time. |
 
-1. Reduce the GRIB grid resolution (if possible).  
-2. Tighten the angle\_diff constraint (e.g., from 80° back to 50°).  
-3. The Dijkstra algorithm is currently calculated on a single-time weather snapshot (the departure time) to maintain graph stability. For time-dynamic routing (isochrones), a 3D graph (Lat, Lon, Time) would be required.
+### Routing
 
-### **Future Extensibility**
+| Function | Description |
+|---|---|
+| `generate_reachable_graph(cache, spm, ...)` | BFS graph construction. Always writes `graph_log.txt` as a side effect. Returns `(nodes, adjacency_map, start_node)`. |
+| `find_shortest_path_dijkstra(start, adj, spm, target_lat, target_lon)` | Dijkstra 2D on static weather snapshot. Path points are **direct references** into `spm` (not copies). |
+| `find_shortest_path_dijkstra_3d(start, spm, target_lat, target_lon, t0, cache)` | Time-aware Dijkstra. Path points are **copies** of `spm` entries with `time` key added. |
+| `simulate_vmg_route(cache, start_lat, start_lon, target_lat, target_lon, start_time)` | Greedy VMG solver. Northbound only (B-04). |
 
-* **Tidal Currents**: Adding a U\_current and V\_current parameter lookup would allow for Course Over Ground (COG) and Speed Over Ground (SOG) calculations.  
-* **Fuel Consumption**: For motor-sailing scenarios, a fuel-per-hour coefficient could be added to the cost function.
+### Output
+
+| Function | Description |
+|---|---|
+| `save_route_detailed_log(points, cache, filename, label)` | Writes a pipe-delimited TXT table: Time \| Lat \| Lon \| TWS \| TWD \| Heading \| TWA \| BS. |
+| `print_route_summary(points, label, time_hours=None)` | Prints total distance and elapsed time to stdout. Crashes with `TypeError` when `time_hours` is `None` and points have no `time` key (B-26). |
+| `save_to_gpx(points, filename, label)` | GPX 1.1 track using `<trkpt>` elements. The Visualiser reads `gpx.waypoints` (`<wpt>`) — zone files are never rendered (B-08). |
+| `save_graph_to_json(nodes, adj, spm, filename)` | Writes JSON with keys `metadata`, `nodes`, `edges`. The Visualiser reads key `"graph"` — graph is never drawn (B-01). Never called from `__main__` (B-02). |
+| `analyze_grib_performance(file_path)` | Prints GRIB grid diagnostics. Opens a file handle with no `finally` block (B-19). |
+
+---
+
+## 4. Engine ↔ Visualiser Contracts
+
+Two file formats are produced by `grib.py` and consumed by `Visualiser.py`. Both contracts are currently broken:
+
+| File | Written by | Key written | Read by | Key read | Status |
+|---|---|---|---|---|---|
+| `sailing_graph.json` | `save_graph_to_json` | `"edges"` | `load_sailing_graph` | `"graph"` | **Broken — B-01** |
+| `*.gpx` (zones) | `save_to_gpx` | `<trkpt>` | `load_area_file` | `gpx.waypoints` (`<wpt>`) | **Broken — B-08** |
+
+---
+
+## 5. Maintenance Notes
+
+### Adjusting safety thresholds
+
+The forbidden-zone limit defaults to **40 kt** and the caution-zone limit to **30 kt**. Both are passed as arguments to `identify_weather_danger_zones` and `identify_safe_sailing_areas` in `__main__`.
+
+### Changing start/target coordinates
+
+Hard-coded in `__main__`. Update `start_lat`, `start_lon`, `target_lat`, `target_lon` directly until the CLI is added (Stage 6 of REFACTORING_PLAN.md).
+
+### Performance
+
+If graph construction is slow:
+- Tighten the `angle_diff` constraint (default ±80°).
+- Reduce GRIB grid resolution at source.
+- Use Dijkstra 2D instead of 3D for a first approximation.
+
+### Running tests
+
+```bash
+pytest tests/ -m "not slow"   # fast feedback (~2 s)
+pytest tests/                 # full suite (~2 min)
+```
+
+See `README.md` for full test documentation.

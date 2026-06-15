@@ -51,20 +51,21 @@ def load_grib_to_memory(file_path):
     
     try:
         grbs = pygrib.open(file_path)
-        for msg in grbs:
-            dt = msg.validDate
-            all_dates.add(dt)
-            param = msg.name
-            
-            if lats is None:
-                lats, lons = msg.latlons()
-                
-            if dt not in weather_cache:
-                weather_cache[dt] = {}
-            
-            weather_cache[dt][param] = msg.values
-            
-        grbs.close()
+        try:
+            for msg in grbs:
+                dt = msg.validDate
+                all_dates.add(dt)
+                param = msg.name
+
+                if lats is None:
+                    lats, lons = msg.latlons()
+
+                if dt not in weather_cache:
+                    weather_cache[dt] = {}
+
+                weather_cache[dt][param] = msg.values
+        finally:
+            grbs.close()
         return {
             'data': weather_cache,
             'dates': sorted(list(all_dates)),
@@ -88,10 +89,15 @@ def get_weather_from_cache(cache, target_lat, target_lon, target_time):
     min_idx = np.unravel_index(np.argmin(dist_sq), dist_sq.shape)
     data_at_time = cache['data'][closest_date]
     
-    u_val = data_at_time.get('10 metre U wind component')[min_idx]
+    u_key = '10 metre u wind component' if '10 metre u wind component' in data_at_time else '10 metre U wind component'
+    u = data_at_time.get(u_key)
     v_key = '10 metre v wind component' if '10 metre v wind component' in data_at_time else '10 metre V wind component'
-    v_val = data_at_time.get(v_key)[min_idx]
-    
+    v = data_at_time.get(v_key)
+    if u is None or v is None:
+        return None
+    u_val = u[min_idx]
+    v_val = v[min_idx]
+
     return {
         'meta': {
             'actual_lat': lats[min_idx], 
@@ -113,11 +119,13 @@ def calculate_bearing(lat1, lon1, lat2, lon2):
     return (math.degrees(math.atan2(y, x)) + 360) % 360
 
 def calculate_distance_nm(lat1, lon1, lat2, lon2):
-    """Calculates distance in nautical miles (nm)."""
-    avg_lat = math.radians((lat1 + lat2) / 2.0)
-    d_lat = (lat2 - lat1) * 60.0
-    d_lon = (lon2 - lon1) * 60.0 * math.cos(avg_lat)
-    return math.sqrt(d_lat**2 + d_lon**2)
+    """Calculates distance in nautical miles using the Haversine formula."""
+    R = 3440.065
+    lat1_r, lat2_r = math.radians(lat1), math.radians(lat2)
+    d_lat = math.radians(lat2 - lat1)
+    d_lon = math.radians(lon2 - lon1)
+    a = math.sin(d_lat / 2) ** 2 + math.cos(lat1_r) * math.cos(lat2_r) * math.sin(d_lon / 2) ** 2
+    return R * 2 * math.asin(math.sqrt(a))
 
 def identify_weather_danger_zones(cache, min_threshold, max_threshold=float('inf')):
     """Identifies true wind speed zones within the entire forecast window."""
@@ -129,7 +137,8 @@ def identify_weather_danger_zones(cache, min_threshold, max_threshold=float('inf
     
     for dt in dates:
         data_at_time = cache['data'][dt]
-        u = data_at_time.get('10 metre U wind component')
+        u_key = '10 metre u wind component' if '10 metre u wind component' in data_at_time else '10 metre U wind component'
+        u = data_at_time.get(u_key)
         v_key = '10 metre v wind component' if '10 metre v wind component' in data_at_time else '10 metre V wind component'
         v = data_at_time.get(v_key)
         if u is not None and v is not None:
@@ -150,7 +159,8 @@ def identify_safe_sailing_areas(cache, max_wind_threshold=30.0):
     max_observed_speed = np.zeros(lats.shape)
     for dt in dates:
         data_at_time = cache['data'][dt]
-        u = data_at_time.get('10 metre U wind component')
+        u_key = '10 metre u wind component' if '10 metre u wind component' in data_at_time else '10 metre U wind component'
+        u = data_at_time.get(u_key)
         v_key = '10 metre v wind component' if '10 metre v wind component' in data_at_time else '10 metre V wind component'
         v = data_at_time.get(v_key)
         if u is not None and v is not None:
@@ -198,6 +208,9 @@ def generate_reachable_graph(cache, safe_points_map, start_lat, start_lon, targe
             
             # Static snapshot for Dijkstra 2D
             weather = get_weather_from_cache(cache, curr_p['lat'], curr_p['lon'], start_time)
+            if weather is None:
+                adjacency_map[(r, c)] = []  # register as dead-end so adjacency_map is complete
+                continue
             u, v = weather['wind_u'], weather['wind_v']
             tws = np.sqrt(u**2 + v**2) * 1.94384
             twd = (math.degrees(math.atan2(-u, -v)) + 360) % 360
@@ -243,9 +256,9 @@ def find_shortest_path_dijkstra(start_node, adjacency_map, safe_points_map, targ
     if not start_node or not adjacency_map: return [], 0
     
     distances = {node: float('inf') for node in adjacency_map.keys()}
-    distances[start_node] = 0
+    distances[start_node] = 0.0
     predecessors = {node: None for node in adjacency_map.keys()}
-    pq = [(0, start_node)]
+    pq = [(0.0, start_node)]
     
     nodes_visited = 0
     while pq:
@@ -257,11 +270,14 @@ def find_shortest_path_dijkstra(start_node, adjacency_map, safe_points_map, targ
             for edge in adjacency_map[curr_node]:
                 neighbor, weight = edge['target'], edge['cost']
                 dist = curr_dist + weight
+                if neighbor not in distances:
+                    distances[neighbor] = float('inf')
+                    predecessors[neighbor] = None
                 if dist < distances[neighbor]:
                     distances[neighbor], predecessors[neighbor] = dist, curr_node
                     heapq.heappush(pq, (dist, neighbor))
                 
-    reachable_and_visited = [n for n in adjacency_map.keys() if distances[n] != float('inf')]
+    reachable_and_visited = [n for n in distances if distances[n] != float('inf')]
     if not reachable_and_visited: 
         return [], 0
     
@@ -272,7 +288,10 @@ def find_shortest_path_dijkstra(start_node, adjacency_map, safe_points_map, targ
     path = []
     curr = best_finish
     while curr is not None:
-        path.append(safe_points_map[curr]); curr = predecessors[curr]
+        waypoint = safe_points_map[curr].copy()
+        waypoint['_cost'] = distances[curr]
+        path.append(waypoint)
+        curr = predecessors[curr]
     return path[::-1], total_cost
 
 def find_shortest_path_dijkstra_3d(start_node, safe_points_map, target_lat, target_lon, start_time, cache):
@@ -317,6 +336,8 @@ def find_shortest_path_dijkstra_3d(start_node, safe_points_map, target_lat, targ
         # Get dynamic weather for current node at current voyage time
         curr_voyage_time = start_time + timedelta(hours=curr_cost)
         weather = get_weather_from_cache(cache, curr_p['lat'], curr_p['lon'], curr_voyage_time)
+        if weather is None:
+            continue
         u, v = weather['wind_u'], weather['wind_v']
         tws = np.sqrt(u**2 + v**2) * 1.94384
         twd = (math.degrees(math.atan2(-u, -v)) + 360) % 360
@@ -388,6 +409,8 @@ def save_route_detailed_log(points, cache, filename, label):
             time = p.get('time', datetime.now())
             
             w = get_weather_from_cache(cache, lat, lon, time)
+            if w is None:
+                continue
             u, v = w['wind_u'], w['wind_v']
             tws = np.sqrt(u**2 + v**2) * 1.94384
             twd = (math.degrees(math.atan2(-u, -v)) + 360) % 360
@@ -413,15 +436,16 @@ def print_route_summary(points, label, time_hours=None):
     if time_hours is None and 'time' in points[0] and 'time' in points[-1]:
         time_hours = (points[-1]['time'] - points[0]['time']).total_seconds() / 3600.0
     avg_speed = dist / time_hours if time_hours and time_hours > 0 else 0
+    time_str = f"{time_hours:.2f} h" if time_hours is not None else "N/A"
     print(f"--- SUMMARY: {label} ---")
-    print(f"Points: {len(points)} | Distance: {dist:.2f} nm | Time: {time_hours:.2f} h | Avg Speed: {avg_speed:.2f} kt\n")
+    print(f"Points: {len(points)} | Distance: {dist:.2f} nm | Time: {time_str} | Avg Speed: {avg_speed:.2f} kt\n")
 
 def save_graph_to_json(reachable_nodes, adjacency_map, safe_points_map, filename="sailing_graph.json"):
     """Saves the graph structure to a JSON file."""
     data = {
         "metadata": {"nodes": len(reachable_nodes), "unit": "hours", "timestamp": datetime.now().isoformat()},
         "nodes": {f"{r},{c}": {"lat": safe_points_map[(r, c)]["lat"], "lon": safe_points_map[(r, c)]["lon"]} for r, c in reachable_nodes},
-        "edges": {f"{r},{c}": [{"target": f"{e['target'][0]},{e['target'][1]}", "cost": round(e['cost'], 4)} for e in edges] for (r, c), edges in adjacency_map.items()}
+        "graph": {f"{r},{c}": [{"target": f"{e['target'][0]},{e['target'][1]}", "cost": round(e['cost'], 4)} for e in edges] for (r, c), edges in adjacency_map.items()}
     }
     with open(filename, 'w', encoding='utf-8') as f: json.dump(data, f, indent=4)
 
@@ -443,7 +467,7 @@ def simulate_vmg_route(cache, start_lat, start_lon, target_lat, target_lon, star
     
     print(f"[VMG DIAG] Start simulation: {curr_time.strftime('%Y-%m-%d %H:%M')}")
     
-    while curr_lat < target_lat:
+    while calculate_distance_nm(curr_lat, curr_lon, target_lat, target_lon) > 1.0:
         weather = get_weather_from_cache(cache, curr_lat, curr_lon, curr_time)
         if not weather: break
         
@@ -481,35 +505,49 @@ def simulate_vmg_route(cache, start_lat, start_lon, target_lat, target_lon, star
             
         dist = best_bs * (time_step_min / 60.0)
         route_points.append({'lat': curr_lat, 'lon': curr_lon, 'time': curr_time})
-        
+
+        old_lat = curr_lat
         curr_lat += (dist * math.cos(math.radians(best_hdg))) / 60.0
-        curr_lon += (dist * math.sin(math.radians(best_hdg))) / (60.0 * math.cos(math.radians(curr_lat)))
+        curr_lon += (dist * math.sin(math.radians(best_hdg))) / (60.0 * math.cos(math.radians(old_lat)))
         curr_time += timedelta(minutes=time_step_min)
         step += 1
-        
-        if calculate_distance_nm(curr_lat, curr_lon, target_lat, target_lon) < 1.0:
-            break
-            
+
         if step >= 10000: break
         
     return route_points
 
-def save_to_gpx(points, filename, label="Route"):
-    """Saves the route track to a GPX file."""
+def save_track_gpx(points, filename, label="Route"):
+    """Saves a route as a GPX track using <trkpt> elements."""
     header = ['<?xml version="1.0" encoding="UTF-8"?>', f'<gpx version="1.1" creator="ScampiRouter" xmlns="http://www.topografix.com/GPX/1/1"><trk><name>{label}</name><trkseg>']
     body = [f'  <trkpt lat="{p["lat"]:.6f}" lon="{p["lon"]:.6f}">' + (f"<time>{p['time'].strftime('%Y-%m-%dT%H:%M:%SZ')}</time>" if 'time' in p else "") + '</trkpt>' for p in points]
     footer = ['</trkseg></trk></gpx>']
     with open(filename, 'w', encoding='utf-8') as f: f.write('\n'.join(header + body + footer))
 
+def save_waypoints_gpx(points, filename, label="Areas"):
+    """Saves a list of points as GPX waypoints using <wpt> elements (for zone files)."""
+    header = ['<?xml version="1.0" encoding="UTF-8"?>', f'<gpx version="1.1" creator="ScampiRouter" xmlns="http://www.topografix.com/GPX/1/1">']
+    body = [f'  <wpt lat="{p["lat"]:.6f}" lon="{p["lon"]:.6f}"><name>{label}</name></wpt>' for p in points]
+    footer = ['</gpx>']
+    with open(filename, 'w', encoding='utf-8') as f: f.write('\n'.join(header + body + footer))
+
+def save_to_gpx(points, filename, label="Route"):
+    """Backward-compatible alias — writes <trkpt> track elements."""
+    save_track_gpx(points, filename, label)
+
 def analyze_grib_performance(file_path):
     """GRIB file diagnostics."""
     if not os.path.exists(file_path): return
-    grbs = pygrib.open(file_path); msg = grbs.readline(); lats, lons = msg.latlons()
-    min_lat, max_lat, min_lon, max_lon = lats.min(), lats.max(), lons.min(), lons.max()
-    sn_nm = (max_lat - min_lat) * 60.0
-    ew_nm = (max_lon - min_lon) * 60.0 * math.cos(math.radians((min_lat + max_lat) / 2.0))
-    print(f"--- GRIB DIAGNOSTICS ---\nGrid: Lat {min_lat:.2f}:{max_lat:.2f}, Lon {min_lon:.2f}:{max_lon:.2f}")
-    print(f"Dimensions: S-N: {sn_nm:.2f} nm, E-W: {ew_nm:.2f} nm\n" + "-"*50); grbs.close()
+    grbs = pygrib.open(file_path)
+    try:
+        msg = grbs.readline()
+        lats, lons = msg.latlons()
+        min_lat, max_lat, min_lon, max_lon = lats.min(), lats.max(), lons.min(), lons.max()
+        sn_nm = (max_lat - min_lat) * 60.0
+        ew_nm = (max_lon - min_lon) * 60.0 * math.cos(math.radians((min_lat + max_lat) / 2.0))
+        print(f"--- GRIB DIAGNOSTICS ---\nGrid: Lat {min_lat:.2f}:{max_lat:.2f}, Lon {min_lon:.2f}:{max_lon:.2f}")
+        print(f"Dimensions: S-N: {sn_nm:.2f} nm, E-W: {ew_nm:.2f} nm\n" + "-"*50)
+    finally:
+        grbs.close()
 
 if __name__ == "__main__":
     file_name = "data/test.grb2"
@@ -527,8 +565,8 @@ if __name__ == "__main__":
 
         if os.path.exists("output/graph_log.txt"): os.remove("output/graph_log.txt")
 
-        save_to_gpx(identify_weather_danger_zones(weather_cache, 40.0), "output/forbidden_areas.gpx", "Wind >40kt")
-        save_to_gpx(identify_weather_danger_zones(weather_cache, 30.0, 40.0), "output/caution_areas.gpx", "Wind 30-40kt")
+        save_waypoints_gpx(identify_weather_danger_zones(weather_cache, 40.0), "output/forbidden_areas.gpx", "Wind >40kt")
+        save_waypoints_gpx(identify_weather_danger_zones(weather_cache, 30.0, 40.0), "output/caution_areas.gpx", "Wind 30-40kt")
         safe_map = identify_safe_sailing_areas(weather_cache, 30.0)
 
         print("\n--- STARTING SIMULATION OF 4 ROUTES EVERY 5 HOURS ---")
@@ -540,10 +578,11 @@ if __name__ == "__main__":
             # --- DIJKSTRA 2D (STATIC SNAPSHOT) ---
             nodes, adj, start_idx = generate_reachable_graph(weather_cache, safe_map, start_lat, start_lon, target_lat, target_lon, current_departure_time, log_file="output/graph_log.txt")
             if nodes:
+                save_graph_to_json(nodes, adj, safe_map, "output/sailing_graph.json")
                 fastest_path_2d, d_cost_2d = find_shortest_path_dijkstra(start_idx, adj, safe_map, target_lat, target_lon)
                 if fastest_path_2d:
-                    for idx, p in enumerate(fastest_path_2d):
-                        p['time'] = current_departure_time + timedelta(hours=(idx * d_cost_2d / len(fastest_path_2d)))
+                    for p in fastest_path_2d:
+                        p['time'] = current_departure_time + timedelta(hours=p.pop('_cost', 0))
                     save_to_gpx(fastest_path_2d, f"output/fastest_path_start_{i}.gpx", f"Dijkstra 2D Route {i}")
                     save_route_detailed_log(fastest_path_2d, weather_cache, f"output/log_dijkstra_start_{i}.txt", f"Dijkstra 2D Route {i}")
                     print_route_summary(fastest_path_2d, f"DIJKSTRA 2D (START {i})", d_cost_2d)

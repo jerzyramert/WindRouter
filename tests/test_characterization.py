@@ -39,6 +39,7 @@ from grib import (
     print_route_summary,
     save_graph_to_json,
     save_to_gpx,
+    save_waypoints_gpx,
     simulate_vmg_route,
 )
 from conftest import make_weather_cache, make_safe_points_map, make_full_adjacency, make_mock_grib_message
@@ -95,25 +96,33 @@ class TestVMGCharacterization:
         )
         self.t0 = self.cache["dates"][0]
 
-    def test_b04_target_south_of_start_returns_empty(self):
-        """B-04: while curr_lat < target_lat — loop never executes when target <= start."""
+    def test_b04_target_south_of_start_returns_route(self):
+        """B-04 fixed: distance-based loop condition works for southbound targets.
+
+        With the bug (while curr_lat < target_lat), start=54.5 > target=53.0 means
+        the condition is False immediately → returns [].  After the fix the loop
+        runs until distance < 1 nm, so the route must be non-empty and must make
+        southward progress.
+        """
         result = simulate_vmg_route(
             self.cache,
             start_lat=54.5, start_lon=2.25,
             target_lat=53.0, target_lon=2.25,
             start_time=self.t0,
         )
-        assert result == [], "B-04: target south of start must produce empty route"
+        assert len(result) > 0, "B-04: southbound route must not be empty after fix"
+        assert result[-1]["lat"] < 54.5, "B-04: route must make southward progress"
 
-    def test_b04_target_same_latitude_returns_empty(self):
-        """B-04: target at same latitude — loop condition False immediately."""
+    def test_b04_target_same_latitude_returns_route(self):
+        """B-04 fixed: distance-based loop condition works when target at same latitude."""
         result = simulate_vmg_route(
             self.cache,
             start_lat=53.5, start_lon=2.25,
             target_lat=53.5, target_lon=2.5,
             start_time=self.t0,
         )
-        assert result == [], "B-04: target at same latitude must produce empty route"
+        assert isinstance(result, list)
+        assert len(result) > 0, "B-04: same-latitude target must produce a non-empty route"
 
 
 # ---------------------------------------------------------------------------
@@ -148,15 +157,14 @@ class TestSaveGraphToJsonCharacterization:
         self.adj = make_full_adjacency(self.spm, cost=1.5)
         self.nodes = set(self.spm.keys())
 
-    def test_b01_engine_writes_edges_key_not_graph(self, tmp_path):
-        """B-01: engine writes adjacency under key 'edges', viewer reads 'graph' — mismatch.
-        This test characterizes the current (broken) behavior."""
+    def test_b01_engine_writes_graph_key(self, tmp_path):
+        """B-01 fixed: engine writes adjacency under key 'graph', matching Visualiser."""
         out = str(tmp_path / "graph.json")
         save_graph_to_json(self.nodes, self.adj, self.spm, filename=out)
         with open(out) as f:
             data = json.load(f)
-        assert "edges" in data, "B-01: engine writes key 'edges'"
-        assert "graph" not in data, "B-01: engine does NOT write key 'graph' (viewer expects this)"
+        assert "graph" in data, "B-01 fixed: engine writes key 'graph'"
+        assert "edges" not in data, "B-01 fixed: 'edges' key removed"
 
 
 # ---------------------------------------------------------------------------
@@ -173,15 +181,14 @@ class TestGetWeatherEdgeCases:
         with pytest.raises((ValueError, TypeError)):
             get_weather_from_cache(cache, 53.0, 2.0, datetime(2026, 4, 20))
 
-    def test_b17_missing_v_component_raises(self):
-        """B-17: get_weather_from_cache crashes when V-component key is absent."""
+    def test_b17_missing_v_component_returns_none(self):
+        """B-22 fixed: get_weather_from_cache returns None when V-component key is absent."""
         cache = make_weather_cache()
-        # Remove V component from all timesteps
         for dt in cache["dates"]:
             cache["data"][dt].pop("10 metre v wind component", None)
             cache["data"][dt].pop("10 metre V wind component", None)
-        with pytest.raises((TypeError, KeyError)):
-            get_weather_from_cache(cache, 53.0, 2.0, cache["dates"][0])
+        result = get_weather_from_cache(cache, 53.0, 2.0, cache["dates"][0])
+        assert result is None
 
     def test_b17_missing_v_safe_areas_silently_skips(self):
         """B-17: identify_safe_sailing_areas silently skips timesteps with missing V.
@@ -237,23 +244,17 @@ class TestDijkstra2DCharacterization:
             f"C-10: expected {expected_last}, got {last_time}"
         )
 
-    def test_neighbor_not_in_distances_raises_keyerror(self):
-        """`distances[neighbor]` raises KeyError when neighbor is not in adj.keys().
-        distances is initialized only from adj.keys() = {(0,0)}.
-        When (0,0) is expanded, neighbor (0,1) is found — but (0,1) is not in distances
-        because it has no entry in adj, so `distances[(0,1)]` raises KeyError.
-        This is a latent bug: generate_reachable_graph only adds nodes reachable from
-        start as adj keys, so in practice neighbor is always in adj — but it's not
-        enforced by the code."""
+    def test_neighbor_not_in_distances_handled_lazily(self):
+        """B-24 fixed: leaf nodes not in adj.keys() are lazily initialised in distances."""
         adj = {
             (0, 0): [{"target": (0, 1), "cost": 1.0}],
             # (0,1) intentionally absent — neighbor but not a source node in adj
         }
         spm = make_safe_points_map(self.LATS[:2], self.LONS[:2])
-        with pytest.raises(KeyError):
-            find_shortest_path_dijkstra(
-                (0, 0), adj, spm, 53.25, 2.25,
-            )
+        path, cost = find_shortest_path_dijkstra(
+            (0, 0), adj, spm, 53.25, 2.25,
+        )
+        assert isinstance(path, list)
 
 
 # ---------------------------------------------------------------------------
@@ -293,9 +294,8 @@ class TestLoadGribToMemoryCharacterization:
         grbs.__iter__ = MagicMock(side_effect=lambda: iter(messages))
         return grbs
 
-    def test_grbs_close_not_called_on_iteration_exception(self, tmp_path, monkeypatch):
-        """B-18: grbs.close() is inside try block with no finally — if iteration raises,
-        close() is skipped and the file handle leaks. This is a known bug."""
+    def test_grbs_close_called_even_on_iteration_exception(self, tmp_path, monkeypatch):
+        """B-18 fixed: grbs.close() is now in a finally block — called even when iteration raises."""
         dummy_file = tmp_path / "test.grib"
         dummy_file.write_bytes(b"")
 
@@ -308,7 +308,7 @@ class TestLoadGribToMemoryCharacterization:
         monkeypatch.setattr(grib_module.pygrib, "open", lambda _: grbs)
         result = self.load(str(dummy_file))
         assert result is None  # exception caught, returns None
-        grbs.close.assert_not_called()  # B-18: close() was skipped — handle leaked
+        grbs.close.assert_called_once()  # B-18 fixed: close() called from finally block
 
     def test_zero_messages_returns_none_lats_lons(self, tmp_path, monkeypatch):
         """REQ-02: empty GRIB (zero messages) returns dict with lats=None, lons=None.
@@ -342,44 +342,98 @@ class TestLoadGribToMemoryCharacterization:
 
 
 # ---------------------------------------------------------------------------
+# analyze_grib_performance characterization (B-19)
+# ---------------------------------------------------------------------------
+
+class TestAnalyzeGribPerformanceCharacterization:
+    def _make_grbs(self, monkeypatch, lats, lons):
+        import numpy as np
+        grbs = MagicMock()
+        msg = MagicMock()
+        msg.latlons.return_value = (np.array(lats), np.array(lons))
+        grbs.readline.return_value = msg
+        monkeypatch.setattr(grib_module.pygrib, "open", MagicMock(return_value=grbs))
+        return grbs
+
+    def test_b19_grbs_close_called_even_on_latlons_exception(self, tmp_path, monkeypatch):
+        """B-19 fixed: grbs.close() is now in a finally block in analyze_grib_performance.
+        The exception still propagates, but close() must be called before it escapes."""
+        dummy_file = tmp_path / "test.grib"
+        dummy_file.write_bytes(b"")
+
+        grbs = MagicMock()
+        msg = MagicMock()
+        msg.latlons.side_effect = RuntimeError("corrupt first message")
+        grbs.readline.return_value = msg
+        monkeypatch.setattr(grib_module.pygrib, "open", MagicMock(return_value=grbs))
+
+        import grib as grib_mod
+        with pytest.raises(RuntimeError):
+            grib_mod.analyze_grib_performance(str(dummy_file))
+
+        grbs.close.assert_called_once()
+
+    def test_b19_happy_path_close_called_and_prints_diagnostics(self, tmp_path, monkeypatch, capsys):
+        """Happy path: analyze_grib_performance prints grid diagnostics and closes file."""
+        dummy_file = tmp_path / "test.grib"
+        dummy_file.write_bytes(b"")
+
+        lats = [[53.0, 53.0], [54.0, 54.0]]
+        lons = [[2.0,  3.0],  [2.0,  3.0]]
+        grbs = self._make_grbs(monkeypatch, lats, lons)
+
+        import grib as grib_mod
+        grib_mod.analyze_grib_performance(str(dummy_file))
+
+        grbs.close.assert_called_once()
+        out = capsys.readouterr().out
+        assert "GRIB DIAGNOSTICS" in out
+        assert "53" in out and "54" in out  # lat range present in output
+
+
+# ---------------------------------------------------------------------------
 # I/O contracts characterization (from TestIOContracts)
 # ---------------------------------------------------------------------------
 
 class TestIOContractsCharacterization:
     """Round-trip between grib.py (writer) and Visualiser (reader) — current broken state."""
 
-    def test_b08_engine_writes_trkpt_not_wpt(self, tmp_path):
-        """B-08 current state: save_to_gpx writes <trkpt>; gpx.waypoints is empty.
-        Visualiser reads gpx.waypoints, so zones are never rendered."""
+    def test_b08_save_waypoints_gpx_writes_wpt_elements(self, tmp_path):
+        """B-08 fixed: save_waypoints_gpx writes <wpt> elements (NOT <trkpt>).
+        Visualiser.load_area_file reads gpx.waypoints; <trkpt> elements are invisible to it."""
         points = [
             {"lat": 53.0, "lon": 2.0},
             {"lat": 53.25, "lon": 2.25},
         ]
         gpx_path = str(tmp_path / "forbidden.gpx")
-        save_to_gpx(points, gpx_path, "Forbidden")
+        save_waypoints_gpx(points, gpx_path, "Forbidden")
 
         with open(gpx_path) as fh:
             gpx = gpxpy.parse(fh)
 
+        assert len(gpx.waypoints) == 2, (
+            "B-08: save_waypoints_gpx must write 2 waypoints readable by gpxpy"
+        )
         n_trkpts = sum(len(seg.points) for trk in gpx.tracks for seg in trk.segments)
-        assert n_trkpts == 2, "Engine writes 2 track points"
-        assert len(gpx.waypoints) == 0, "B-08: current engine writes <trkpt>, not <wpt>"
+        assert n_trkpts == 0, "B-08: save_waypoints_gpx must NOT write any <trkpt> elements"
 
-    def test_b08_raw_gpx_contains_trkpt_element(self, tmp_path):
-        """B-08 current state: raw XML contains <trkpt> not <wpt>."""
+    def test_b08_save_waypoints_gpx_raw_xml_contains_wpt(self, tmp_path):
+        """B-08 fixed: raw XML produced by save_waypoints_gpx contains <wpt> not <trkpt>."""
         points = [{"lat": 54.0, "lon": 3.0}]
         gpx_path = str(tmp_path / "caution.gpx")
-        save_to_gpx(points, gpx_path, "Caution")
+        save_waypoints_gpx(points, gpx_path, "Caution")
 
         with open(gpx_path) as fh:
             raw = fh.read()
 
-        assert "<trkpt" in raw, "Engine must write <trkpt> element (documents current state)"
-        assert "<wpt" not in raw, "B-08: engine does not write <wpt> — Visualiser cannot read zone"
+        assert "<wpt" in raw, "B-08: save_waypoints_gpx must write <wpt> element"
+        assert "<trkpt" not in raw, (
+            "B-08: save_waypoints_gpx must NOT write <trkpt> — "
+            "Visualiser reads waypoints, not track segments"
+        )
 
-    def test_b01_engine_writes_edges_key_not_graph(self, tmp_path):
-        """B-01 current state: save_graph_to_json writes key 'edges'.
-        Visualiser reads data.get('graph', {}) → always returns {} → grid never drawn."""
+    def test_b01_engine_writes_graph_key(self, tmp_path):
+        """B-01 fixed: save_graph_to_json writes key 'graph' readable by Visualiser."""
         nodes = {(0, 0), (0, 1), (1, 0)}
         adj = {
             (0, 0): [{"target": (0, 1), "cost": 1.0}, {"target": (1, 0), "cost": 1.4}],
@@ -397,11 +451,11 @@ class TestIOContractsCharacterization:
         with open(json_path) as fh:
             data = json.load(fh)
 
-        assert "edges" in data, "B-01 current state: engine writes 'edges' key"
-        assert "graph" not in data, "B-01 current state: 'graph' key absent — Visualiser sees empty adj"
+        assert "graph" in data, "B-01 fixed: engine writes 'graph' key"
+        assert "edges" not in data, "B-01 fixed: 'edges' key removed"
 
-    def test_b01_visualiser_simulation_sees_zero_edges(self, tmp_path):
-        """B-01: simulating load_sailing_graph with current key gives edges_drawn == 0."""
+    def test_b01_visualiser_simulation_sees_correct_edges(self, tmp_path):
+        """B-01 fixed: Visualiser reads 'graph' key and gets the correct edge count."""
         nodes = {(0, 0), (0, 1)}
         adj = {
             (0, 0): [{"target": (0, 1), "cost": 0.5}],
@@ -417,13 +471,10 @@ class TestIOContractsCharacterization:
         with open(json_path) as fh:
             data = json.load(fh)
 
-        # Simulate exactly what load_sailing_graph does:
         visualiser_adj = data.get("graph", {})
         edges_drawn = sum(len(targets) for targets in visualiser_adj.values())
 
-        assert edges_drawn == 0, (
-            "B-01: Visualiser reads 'graph' key which is absent → 0 edges drawn"
-        )
+        assert edges_drawn == 1, "B-01 fixed: Visualiser reads 'graph' key → 1 edge drawn"
 
 
 # ---------------------------------------------------------------------------
@@ -431,15 +482,11 @@ class TestIOContractsCharacterization:
 # ---------------------------------------------------------------------------
 
 class TestDistanceCharacterization:
-    def test_near_antimeridian_gives_large_wrong_value(self):
-        """C-29 / B-21 limitation: flat formula uses lon2-lon1 directly.
-        Crossing the antimeridian gives a huge erroneous distance (~21000 nm).
-        This test documents the known bug — real distance is ~120 nm."""
+    def test_near_antimeridian_gives_correct_haversine_value(self):
+        """B-21 fixed: Haversine handles antimeridian crossing correctly (~120 nm)."""
         d = calculate_distance_nm(0.0, 179.0, 0.0, -179.0)
-        # Real great-circle distance ≈ 120 nm; flat formula gives ~21480 nm
-        assert d > 10000.0, (
-            f"Antimeridian crossing gives wrong distance {d:.1f} nm "
-            "(expected ~21000 with flat formula — documents the limitation)"
+        assert d < 200.0, (
+            f"Haversine must give ~120 nm for antimeridian crossing, got {d:.1f} nm"
         )
 
 
@@ -448,12 +495,99 @@ class TestDistanceCharacterization:
 # ---------------------------------------------------------------------------
 
 class TestPrintRouteSummaryCharacterization:
-    def test_b26_none_time_hours_raises_type_error(self):
-        """B-26: {time_hours:.2f} crashes with TypeError when time_hours is None.
-        Documents the bug — points have no 'time' key, no time_hours arg passed."""
+    def test_b26_none_time_hours_prints_na(self, capsys):
+        """B-26 fixed: print_route_summary prints 'N/A' instead of crashing when time_hours is None."""
         points = [
             {"lat": 53.0,  "lon": 2.0},
             {"lat": 53.25, "lon": 2.25},
         ]
-        with pytest.raises(TypeError):
-            print_route_summary(points, "Test")
+        print_route_summary(points, "Test")
+        out = capsys.readouterr().out
+        assert "N/A" in out
+
+
+# ---------------------------------------------------------------------------
+# Visualiser characterization (B-27)
+# ---------------------------------------------------------------------------
+
+class TestVisualiserCharacterization:
+    """B-27: check_files_loop reschedules root.after unconditionally (not gated by force),
+    and force_reload_areas cancels the existing timer before calling check_files_loop
+    so that exactly one polling chain exists at all times."""
+
+    def _make_app(self):
+        """Build a GPXViewerApp with all Tk/map calls stubbed out."""
+        import sys
+        tk_mod = MagicMock()
+        tk_mod.BooleanVar.return_value.get.return_value = False
+        sys.modules.setdefault("tkinter", tk_mod)
+        sys.modules.setdefault("tkinter.filedialog", MagicMock())
+        sys.modules.setdefault("tkinter.messagebox", MagicMock())
+        sys.modules.setdefault("tkintermapview", MagicMock())
+        sys.modules.setdefault("gpxpy", MagicMock())
+        sys.modules.setdefault("gpxpy.gpx", MagicMock())
+        sys.modules.setdefault("global_land_mask", MagicMock())
+
+        import importlib
+        import Visualiser as vis_mod
+        importlib.reload(vis_mod)
+
+        root = MagicMock()
+        # root.after() returns a fake timer ID each call
+        root.after.side_effect = lambda delay, fn: object()
+
+        app = vis_mod.GPXViewerApp.__new__(vis_mod.GPXViewerApp)
+        app.root = root
+        app.vmg_files = []
+        app.fastest_files = []
+        app.fastest_3d_files = []
+        app.forbidden_file = "nonexistent_forbidden.gpx"
+        app.not_recommended_file = "nonexistent_not_recommended.gpx"
+        app.graph_file = "nonexistent_graph.json"
+        app.last_vmg_mtimes = []
+        app.last_fastest_mtimes = []
+        app.last_fastest_3d_mtimes = []
+        app.last_forbidden_mtime = 0
+        app.last_not_recommended_mtime = 0
+        app.last_graph_mtime = 0
+        app._poll_after_id = None
+        app.show_land_mask_var = MagicMock()
+        app.show_land_mask_var.get.return_value = False
+        return app
+
+    def test_b27_normal_call_reschedules_timer(self):
+        """B-27 fixed: check_files_loop always calls root.after(10000, ...) — normal call."""
+        app = self._make_app()
+        app.check_files_loop()
+        app.root.after.assert_called_once_with(10000, app.check_files_loop)
+
+    def test_b27_force_call_also_reschedules_timer(self):
+        """B-27 fixed: check_files_loop always calls root.after even when force=True."""
+        app = self._make_app()
+        app.check_files_loop(force=True)
+        app.root.after.assert_called_once_with(10000, app.check_files_loop)
+
+    def test_b27_force_reload_does_not_duplicate_timer_chain(self):
+        """B-27 fix must not spawn a second timer chain.
+        Scenario: normal poll runs (timer A scheduled), then force_reload_areas() is called.
+        force_reload_areas must cancel timer A before calling check_files_loop,
+        so root.after is called exactly twice total (once normal, once forced),
+        and after_cancel is called once with the first timer's ID."""
+        app = self._make_app()
+
+        # Step 1: normal poll — schedules timer A, stores ID in _poll_after_id
+        app.check_files_loop()
+        timer_a = app._poll_after_id
+        assert timer_a is not None, "Normal poll must store timer ID"
+        assert app.root.after.call_count == 1
+
+        # Step 2: user clicks checkbox — force_reload_areas cancels timer A, then polls
+        app.force_reload_areas()
+
+        # after_cancel must have been called with timer A's ID
+        app.root.after_cancel.assert_called_once_with(timer_a)
+        # root.after called exactly twice total (step 1 + step 2), not three times
+        assert app.root.after.call_count == 2, (
+            f"Expected 2 root.after calls (normal + forced), got {app.root.after.call_count}. "
+            "Timer chain was duplicated."
+        )

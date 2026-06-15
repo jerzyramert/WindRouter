@@ -26,6 +26,7 @@ from grib import (
     print_route_summary,
     save_graph_to_json,
     save_to_gpx,
+    save_waypoints_gpx,
     simulate_vmg_route,
 )
 from conftest import make_weather_cache
@@ -42,7 +43,6 @@ class TestBugFixes:
     """
 
     @pytest.mark.slow
-    @pytest.mark.xfail(strict=True, reason="B-04: loop `while curr_lat < target_lat` never runs for southbound target")
     def test_b04_southbound_vmg_returns_non_empty_route(self):
         """After B-04 is fixed, a southbound target must produce a real route."""
         cache = make_weather_cache(
@@ -59,17 +59,38 @@ class TestBugFixes:
         assert len(result) > 0, "Southbound route must not be empty after B-04 fix"
         assert result[-1]["lat"] < 54.0, "Route must make southward progress"
 
-    @pytest.mark.xfail(strict=True, reason="B-08: save_to_gpx writes <trkpt>, Visualiser needs <wpt>")
     def test_b08_zone_gpx_written_as_waypoints(self, tmp_path):
-        """After B-08 is fixed, zone GPX files must contain <wpt> elements."""
+        """B-08 fixed: save_waypoints_gpx writes <wpt> elements readable by Visualiser."""
         points = [{"lat": 53.0, "lon": 2.0}]
         gpx_path = str(tmp_path / "zone.gpx")
-        save_to_gpx(points, gpx_path)
+        save_waypoints_gpx(points, gpx_path)
         with open(gpx_path) as fh:
             gpx = gpxpy.parse(fh)
-        assert len(gpx.waypoints) == 1, "Zone files must use <wpt> after B-08 fix"
+        assert len(gpx.waypoints) == 1, "Zone files must use <wpt>"
 
-    @pytest.mark.xfail(strict=True, reason="B-01: engine writes key 'edges', Visualiser reads 'graph'")
+    def test_b08_save_waypoints_gpx_does_not_write_trkpt(self, tmp_path):
+        """B-08: save_waypoints_gpx must write <wpt>, NOT <trkpt>.
+
+        Regression: reverting B-08 (removing save_waypoints_gpx and routing zone
+        files through save_to_gpx) would produce <trkpt> elements.  Visualiser
+        reads gpx.waypoints; if <wpt> is absent, zones never render.
+        """
+        points = [{"lat": 53.0, "lon": 2.0}, {"lat": 54.0, "lon": 3.0}]
+        gpx_path = str(tmp_path / "zones.gpx")
+        save_waypoints_gpx(points, gpx_path)
+        raw = open(gpx_path).read()
+        assert "<wpt" in raw, "B-08: save_waypoints_gpx must produce <wpt> elements"
+        assert "<trkpt" not in raw, (
+            "B-08: save_waypoints_gpx must NOT produce <trkpt> — "
+            "Visualiser reads waypoints, not track points"
+        )
+        with open(gpx_path) as fh:
+            gpx = gpxpy.parse(fh)
+        assert len(gpx.waypoints) == 2, (
+            "B-08: both zone points must be readable as waypoints by gpxpy"
+        )
+
+
     def test_b01_graph_json_uses_graph_key(self, tmp_path):
         """After B-01 is fixed, the JSON key must be 'graph' so Visualiser can read it."""
         nodes = {(0, 0), (0, 1)}
@@ -84,7 +105,6 @@ class TestBugFixes:
         assert "graph" in data, "After B-01 fix, key must be 'graph' not 'edges'"
         assert "edges" not in data
 
-    @pytest.mark.xfail(strict=True, reason="B-18: grbs.close() not in finally — handle leaks on exception")
     def test_b18_file_handle_closed_even_on_iteration_exception(self, tmp_path, monkeypatch):
         """After B-18 is fixed, grbs.close() must be called even when iteration raises."""
         dummy = tmp_path / "bad.grib"
@@ -98,7 +118,6 @@ class TestBugFixes:
 
         grbs.close.assert_called_once()  # must be called from finally block
 
-    @pytest.mark.xfail(strict=True, reason="B-21: flat-earth formula breaks at the antimeridian — lon crossing gives ~21000 nm instead of ~120 nm")
     def test_b21_distance_handles_antimeridian_crossing(self):
         """After B-21 is fixed with proper Haversine, antimeridian crossing must give ~120 nm.
         The flat formula uses raw lon2-lon1 = -358° which inflates to ~21000 nm."""
@@ -110,7 +129,6 @@ class TestBugFixes:
             "Fix: use Haversine with modular lon diff."
         )
 
-    @pytest.mark.xfail(strict=True, reason="B-24: distances pre-seeded only from adjacency_map keys — leaf nodes raise KeyError")
     def test_b24_dijkstra_2d_handles_leaf_nodes_without_keyerror(self):
         """After B-24 is fixed, a leaf node (target-only, no outgoing edges) must not raise KeyError."""
         # (0,1) is a target node but has no entry as a source in adj
@@ -127,7 +145,6 @@ class TestBugFixes:
         assert len(path) >= 1
         assert cost >= 0.0
 
-    @pytest.mark.xfail(strict=True, reason="B-26: print_route_summary crashes with TypeError when time_hours is None")
     def test_b26_print_route_summary_none_time_hours_does_not_crash(self):
         """After B-26 is fixed, summary must print 'N/A' instead of crashing."""
         points = [
@@ -142,31 +159,89 @@ class TestBugFixes:
             pytest.fail(f"B-26: print_route_summary crashed with TypeError: {e}")
 
     @pytest.mark.slow
-    @pytest.mark.xfail(strict=True, reason="B-20: curr_lon update uses already-incremented curr_lat — cos() sees wrong latitude")
-    def test_b20_vmg_lon_update_uses_pre_advance_latitude(self):
-        """After B-20 is fixed, the cos() in the lon update must use lat BEFORE the
-        lat increment on the same step. Test uses a NE diagonal route where the
-        latitude error accumulates meaningfully over many steps."""
-        # Large latitudinal range so the bug's cos() error compounds over ~100+ steps
+    def test_b20_vmg_lon_update_uses_pre_advance_latitude(self, monkeypatch):
+        """B-20 fixed: lon update uses old_lat (before lat increment), not new_lat.
+
+        Strategy: intercept the heading and boat-speed chosen by VMG on the first step
+        by monkeypatching grib.calculate_distance_nm so the loop exits after exactly
+        one advance. Then independently compute expected_lon using old_lat and
+        expected_lon_buggy using new_lat. Assert actual lon matches expected_lon.
+        """
+        import math as _math
+        import grib as grib_mod
+        from grib import get_scampi_30_polars, calculate_bearing
+
         cache = make_weather_cache(
             lats_1d=[53.0, 53.25, 53.5, 53.75, 54.0, 54.25, 54.5, 54.75, 55.0],
             lons_1d=[2.0, 2.25, 2.5, 2.75, 3.0, 3.25, 3.5],
-            u_speed=5.0, v_speed=5.0,  # wind from SW — NE sailing
+            u_speed=5.0, v_speed=5.0,   # SW wind ~13.6 kt, TWD=225°
         )
-        # With the bug: lon update uses cos(new_lat) instead of cos(old_lat)
-        # The sign of the error depends on direction. We verify the computation
-        # is self-consistent: running the route twice with identical inputs
-        # must give bitwise-identical results (regression guard).
-        result1 = simulate_vmg_route(
-            cache, start_lat=53.0, start_lon=2.0, target_lat=54.75, target_lon=3.25,
-            start_time=cache["dates"][0],
+        start_lat, start_lon = 53.0, 2.0
+        target_lat, target_lon = 54.75, 3.25
+        t0 = cache["dates"][0]
+
+        # Intercept the best_hdg chosen at step 0 by capturing math.cos calls.
+        # Simpler: run the full route and inspect result[1], but compute expected lon
+        # from scratch using get_scampi_30_polars + the known weather at (53.0, 2.0).
+        from grib import get_weather_from_cache, calculate_distance_nm
+        weather = get_weather_from_cache(cache, start_lat, start_lon, t0)
+        u, v = weather["wind_u"], weather["wind_v"]
+        # True wind speed and direction
+        tws_kt = _math.sqrt(u**2 + v**2) * 1.94384
+        twd = (_math.degrees(_math.atan2(-u, -v)) + 360) % 360
+
+        polars = get_scampi_30_polars()
+        time_step_min = 10.0
+
+        # Find the best heading VMG would choose (mirrors the inner loop logic)
+        best_vmg, best_hdg, best_bs = -1.0, None, None
+        for hdg in range(0, 360, 2):
+            twa = (hdg - twd + 360) % 360
+            if twa < 32 or twa > 328:
+                continue
+            twa_sym = twa if twa <= 180 else 360 - twa
+            bs = polars([twa_sym, tws_kt])[0]
+            if bs <= 0:
+                continue
+            dist_step = bs * (time_step_min / 60.0)
+            next_lat = start_lat + (dist_step * _math.cos(_math.radians(hdg))) / 60.0
+            next_lon = start_lon + (dist_step * _math.sin(_math.radians(hdg))) / (
+                60.0 * _math.cos(_math.radians(start_lat))  # old_lat — correct formula
+            )
+            vmg = calculate_distance_nm(start_lat, start_lon, target_lat, target_lon) - \
+                  calculate_distance_nm(next_lat, next_lon, target_lat, target_lon)
+            if vmg > best_vmg:
+                best_vmg, best_hdg, best_bs = vmg, hdg, bs
+
+        assert best_hdg is not None, "Test setup: VMG must find a valid heading"
+
+        # Compute expected p1.lon analytically using old_lat (the correct formula)
+        dist = best_bs * (time_step_min / 60.0)
+        expected_lon_correct = start_lon + (dist * _math.sin(_math.radians(best_hdg))) / (
+            60.0 * _math.cos(_math.radians(start_lat))  # old_lat
         )
-        result2 = simulate_vmg_route(
-            cache, start_lat=53.0, start_lon=2.0, target_lat=54.75, target_lon=3.25,
-            start_time=cache["dates"][0],
+        # And what the buggy formula (new_lat) would have produced
+        new_lat = start_lat + (dist * _math.cos(_math.radians(best_hdg))) / 60.0
+        expected_lon_buggy = start_lon + (dist * _math.sin(_math.radians(best_hdg))) / (
+            60.0 * _math.cos(_math.radians(new_lat))   # new_lat — the bug
         )
-        assert result1 == result2, "Deterministic route must be identical across calls"
-        # After fix, lon step must use old lat: assert that a manual single-step
-        # using old_lat gives the same result as the engine.
-        # (This assertion will XPASS once B-20 is fixed.)
-        assert False, "Placeholder: replace with actual lat-before/after comparison after fix"
+
+        # Sanity: the two formulas must give different values for this to be a real test
+        assert not _math.isclose(expected_lon_correct, expected_lon_buggy, rel_tol=1e-9), (
+            "Test setup error: old_lat and new_lat formulas give identical lon — "
+            "heading has no E-W component, choose a different scenario"
+        )
+
+        # Run the actual implementation
+        result = simulate_vmg_route(
+            cache, start_lat=start_lat, start_lon=start_lon,
+            target_lat=target_lat, target_lon=target_lon,
+            start_time=t0,
+        )
+        assert len(result) >= 2, "B-20: route must have at least 2 points"
+
+        actual_lon = result[1]["lon"]
+        assert actual_lon == pytest.approx(expected_lon_correct, abs=1e-9), (
+            f"B-20: p1.lon={actual_lon:.10f} does not match old_lat formula "
+            f"({expected_lon_correct:.10f}); buggy new_lat formula gives {expected_lon_buggy:.10f}"
+        )

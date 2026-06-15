@@ -64,36 +64,33 @@ class TestCalculateDistanceNm:
         assert calculate_distance_nm(53.0, 2.0, 53.0, 2.0) == pytest.approx(0.0)
 
     def test_one_degree_latitude_approx_60nm(self):
+        """B-21: Haversine gives ~60.04 nm per degree of latitude.
+        Flat-earth gives exactly 60.00 nm. Tolerance 0.01 distinguishes them."""
         d = calculate_distance_nm(53.0, 2.0, 54.0, 2.0)
-        assert abs(d - 60.0) < 1.0, f"Expected ~60 nm, got {d}"
+        assert d == pytest.approx(60.04, abs=0.01), (
+            f"Expected ~60.04 nm (Haversine), got {d:.4f}. "
+            "Flat-earth gives 60.000 and would fail this assertion."
+        )
 
     def test_longitude_uses_cos_correction(self):
-        """C-29: uses cos(avg_lat) correction — not pure flat-earth."""
+        """B-21: E-W distance uses proper spherical geometry.
+        Haversine gives 35.708 nm; flat-earth (cos avg_lat) gives 35.689 nm.
+        Tolerance 0.01 distinguishes them."""
         d_ns = calculate_distance_nm(53.0, 2.0, 54.0, 2.0)
         d_ew = calculate_distance_nm(53.5, 2.0, 53.5, 3.0)
-        # E-W degree at 53.5°N ≈ 60 × cos(53.5°) ≈ 35.7 nm
         assert d_ew < d_ns, "E-W distance should be shorter than N-S at 53°N"
-        assert abs(d_ew - 35.7) < 1.0, f"Expected ~35.7 nm E-W at 53.5°N, got {d_ew}"
-
-    def test_cos_correction_uses_average_latitude(self):
-        """C-29: cos factor uses average of both latitudes, not departure latitude.
-        Use asymmetric endpoints so avg_lat (53.5°) ≠ departure_lat (53.0°).
-        avg_lat formula: d_lon × 60 × cos(avg_lat_rad) where avg = (53+54)/2 = 53.5°
-        departure_lat formula would use cos(53.0°) instead — gives different result."""
-        # Asymmetric pair: lat1=53.0, lat2=54.0, lon difference = 1.0°
-        d = calculate_distance_nm(53.0, 2.0, 54.0, 3.0)
-        avg_lat_rad = math.radians((53.0 + 54.0) / 2.0)  # 53.5°
-        dep_lat_rad = math.radians(53.0)
-        d_lat = (54.0 - 53.0) * 60.0
-        d_lon_avg = (3.0 - 2.0) * 60.0 * math.cos(avg_lat_rad)
-        d_lon_dep = (3.0 - 2.0) * 60.0 * math.cos(dep_lat_rad)
-        expected_avg = math.sqrt(d_lat**2 + d_lon_avg**2)
-        expected_dep = math.sqrt(d_lat**2 + d_lon_dep**2)
-        assert d == pytest.approx(expected_avg, abs=0.001), (
-            f"C-29: expected avg_lat formula ({expected_avg:.4f} nm), got {d:.4f} nm"
+        assert d_ew == pytest.approx(35.71, abs=0.01), (
+            f"Expected 35.71 nm E-W at 53.5°N (Haversine), got {d_ew:.4f}. "
+            "Flat-earth gives ~35.689 nm and would fail this assertion."
         )
-        assert d != pytest.approx(expected_dep, abs=0.001), (
-            "C-29: result must differ from departure_lat formula"
+
+    def test_haversine_known_value(self):
+        """B-21 fixed: Haversine gives accurate result for a known 1° lat/lon diagonal.
+        Haversine: 69.857 nm; flat-earth: 69.812 nm. Tolerance 0.01 distinguishes them."""
+        d = calculate_distance_nm(53.0, 2.0, 54.0, 3.0)
+        assert d == pytest.approx(69.857, abs=0.01), (
+            f"Expected 69.857 nm (Haversine), got {d:.4f}. "
+            "Flat-earth gives 69.812 nm and would fail this assertion."
         )
 
     def test_symmetry(self):
@@ -327,6 +324,55 @@ class TestGenerateReachableGraph(object):
             content = f.read()
         assert "GRAPH CONSTRUCTION LOG" in content
 
+    def test_b23_none_weather_node_registered_as_dead_end(self, tmp_path, monkeypatch):
+        """B-23: when get_weather_from_cache returns None for the start node, the
+        start node must still be registered in adjacency_map as an empty list (dead-end).
+
+        Regression check: without the fix ('adjacency_map[(r,c)] = []' before 'continue'),
+        the start node is in reachable_nodes but absent from adjacency_map.
+        Any code that later does 'adj[start_idx]' raises KeyError.
+
+        We verify by asserting start_idx is in adj after the call.  With the bug
+        (just 'continue'), start_idx is present in 'nodes' but missing from 'adj'.
+        """
+        import grib as grib_mod
+
+        cache = make_weather_cache(
+            lats_1d=[53.0, 53.25, 53.5, 53.75, 54.0],
+            lons_1d=[2.0, 2.25, 2.5, 2.75],
+            u_speed=5.0, v_speed=0.0,
+        )
+        spm = identify_safe_sailing_areas(cache)
+        log = str(tmp_path / "graph_log.txt")
+
+        # Return None only for the start node's coordinates; let other nodes work.
+        # The start node is at lat≈53.0, lon≈2.0.
+        original_fn = grib_mod.get_weather_from_cache
+
+        def patched(c, lat, lon, t):
+            if abs(lat - 53.0) < 0.01 and abs(lon - 2.0) < 0.01:
+                return None
+            return original_fn(c, lat, lon, t)
+
+        monkeypatch.setattr(grib_mod, "get_weather_from_cache", patched)
+
+        nodes, adj, start_idx = generate_reachable_graph(
+            cache, spm,
+            start_lat=53.0, start_lon=2.0,
+            target_lat=54.75, target_lon=2.75,
+            start_time=cache["dates"][0],
+            log_file=log,
+        )
+
+        # start_idx was visited (weather=None path) — must be registered in adj
+        assert start_idx is not None, "start_idx must be found even when weather=None"
+        assert start_idx in nodes, "start_idx must be in reachable_nodes"
+        assert start_idx in adj, (
+            "B-23: start node with weather=None must appear in adjacency_map as "
+            "an empty list; without the fix it is absent and adj[start_idx] raises KeyError"
+        )
+        assert adj[start_idx] == [], "B-23: dead-end node must have empty edge list"
+
 
 # ---------------------------------------------------------------------------
 # Dijkstra 2D (REQ-06)
@@ -382,6 +428,9 @@ class TestDijkstra2D:
             assert "max_speed" in pt
             # No 'time' key — added externally in __main__
             assert "time" not in pt
+            # B-25: _cost must be present (consumed by __main__ for timestamp injection)
+            assert "_cost" in pt
+            assert isinstance(pt["_cost"], float)
 
     def test_returns_empty_list_for_no_start_node(self):
         path, cost = find_shortest_path_dijkstra(
@@ -407,28 +456,63 @@ class TestDijkstra2D:
         assert len(path) > 0
         assert cost > 0
 
-    def test_path_is_direct_reference_not_copy(self):
-        """REQ-06: waypoints are direct references into safe_points_map, not copies."""
+    def test_path_is_copy_not_reference(self):
+        """B-25 fix: waypoints are now copies (to allow safe _cost→time injection)."""
         path, _ = find_shortest_path_dijkstra(
             self.start_node, self.adj, self.spm,
             self.target_lat, self.target_lon,
         )
         assert len(path) > 0
-        # Record original lat before any mutation
         original_lat = path[0]["lat"]
-        original_lon = path[0]["lon"]
-        # Find the spm key that matches this point by coordinates
         spm_key = next(
             k for k, v in self.spm.items()
-            if v["lat"] == pytest.approx(original_lat) and v["lon"] == pytest.approx(original_lon)
+            if v["lat"] == pytest.approx(original_lat)
         )
-        # Mutate through the path reference
         path[0]["lat"] = 999.0
-        # The spm entry must be the same object — mutation must be visible there too
-        assert self.spm[spm_key]["lat"] == 999.0, (
-            "REQ-06: path[0] must be a direct reference into spm, not a copy"
+        assert self.spm[spm_key]["lat"] == pytest.approx(original_lat), (
+            "B-25: path waypoints must be copies, not references into spm"
         )
-        path[0]["lat"] = original_lat  # restore
+
+    def test_b25_cost_values_are_cumulative_dijkstra_distances_not_linear(self):
+        """B-25: _cost must equal the accumulated Dijkstra distance for each node,
+        NOT a linearly-interpolated fraction of total cost.
+
+        With non-uniform edge costs (1.0, 3.0, 0.5), Dijkstra gives:
+          node 0: 0.0,  node 1: 1.0,  node 2: 4.0,  node 3: 4.5
+        Linear interpolation of total 4.5 across 4 nodes would give:
+          0.0, 1.5, 3.0, 4.5  — distinctly different at positions 1 and 2.
+
+        Regression: restoring linear interpolation makes costs[1]=1.5, costs[2]=3.0,
+        both of which differ from expected by > 0.1.
+        """
+        spm_4 = {
+            (0, 0): {"lat": 53.0,  "lon": 2.0,   "max_speed": 6.0},
+            (0, 1): {"lat": 53.0,  "lon": 2.25,  "max_speed": 6.0},
+            (0, 2): {"lat": 53.0,  "lon": 2.5,   "max_speed": 6.0},
+            (0, 3): {"lat": 53.0,  "lon": 2.75,  "max_speed": 6.0},
+        }
+        adj_4 = {
+            (0, 0): [{"target": (0, 1), "cost": 1.0}],
+            (0, 1): [{"target": (0, 2), "cost": 3.0}],
+            (0, 2): [{"target": (0, 3), "cost": 0.5}],
+            (0, 3): [],
+        }
+        path, total_cost = find_shortest_path_dijkstra(
+            (0, 0), adj_4, spm_4, 53.0, 2.75
+        )
+        assert len(path) == 4, "Path must have all 4 nodes"
+        costs = [p["_cost"] for p in path]
+
+        # Dijkstra cumulative costs
+        assert costs[0] == pytest.approx(0.0, abs=1e-9)
+        assert costs[1] == pytest.approx(1.0, abs=1e-9), (
+            f"_cost[1]={costs[1]:.4f}: Dijkstra=1.0, linear-interp=1.5"
+        )
+        assert costs[2] == pytest.approx(4.0, abs=1e-9), (
+            f"_cost[2]={costs[2]:.4f}: Dijkstra=4.0, linear-interp=3.0"
+        )
+        assert costs[3] == pytest.approx(4.5, abs=1e-9)
+        assert total_cost == pytest.approx(4.5, abs=1e-9)
 
 
 # ---------------------------------------------------------------------------
@@ -709,22 +793,25 @@ class TestDijkstra3DEdgeCases:
         self.start_node = min(self.spm.keys())
         self.t0 = self.cache["dates"][0]
 
-    def test_b14_none_weather_during_expansion_raises_typeerror(self):
-        """B-14: if get_weather_from_cache returns None during edge expansion,
-        the next line weather['wind_u'] raises TypeError."""
-        # Make a cache that returns None for all lookups by clearing dates
-        # so that the cache is falsy at the function level
-        bad_cache = {}  # falsy cache — get_weather_from_cache returns None immediately
-        # 3D Dijkstra's internal guard: `if not start_node or not safe_points_map`
-        # does NOT guard against bad_cache. The crash happens inside the expansion loop.
-        # However, with an empty cache dict, get_weather_from_cache returns None
-        # and then `weather['wind_u']` raises TypeError.
-        with pytest.raises(TypeError):
-            find_shortest_path_dijkstra_3d(
-                self.start_node, self.spm,
-                54.75, 2.75,
-                self.t0, bad_cache,
-            )
+    def test_b14_none_weather_during_expansion_skips_node(self):
+        """B-14 fixed: if get_weather_from_cache returns None during edge expansion,
+        the node is skipped (continue) instead of crashing with TypeError.
+        Uses a truthy cache with missing wind keys so get_weather_from_cache returns
+        None mid-traversal, exercising the `if weather is None: continue` fix site."""
+        # Build a cache that passes the `if not cache` guard but has no wind keys,
+        # so get_weather_from_cache returns None on every actual lookup.
+        cache_no_wind = {
+            "data": {self.t0: {}},   # valid timestep, but no wind component keys
+            "dates": [self.t0],
+            "lats": self.cache["lats"],
+            "lons": self.cache["lons"],
+        }
+        result, cost = find_shortest_path_dijkstra_3d(
+            self.start_node, self.spm,
+            54.75, 2.75,
+            self.t0, cache_no_wind,
+        )
+        assert isinstance(result, list), "Must return a list, not raise TypeError"
 
 
 @pytest.mark.slow
@@ -895,12 +982,12 @@ class TestSaveGraphToJson:
         assert isinstance(data, dict)
 
     def test_top_level_keys(self, tmp_path):
-        """REQ-10: JSON has exactly three top-level keys: metadata, nodes, edges."""
+        """REQ-10: JSON has exactly three top-level keys: metadata, nodes, graph."""
         out = str(tmp_path / "graph.json")
         save_graph_to_json(self.nodes, self.adj, self.spm, filename=out)
         with open(out) as f:
             data = json.load(f)
-        assert set(data.keys()) == {"metadata", "nodes", "edges"}
+        assert set(data.keys()) == {"metadata", "nodes", "graph"}
 
     def test_node_keys_are_row_col_strings(self, tmp_path):
         """REQ-10: node keys are strings in format 'row,col'."""
@@ -1495,7 +1582,7 @@ class TestSaveGraphToJsonGaps:
         save_graph_to_json(nodes, adj, spm, json_path)
 
         data = json.loads(open(json_path).read())
-        edges_00 = data["edges"]["0,0"]
+        edges_00 = data["graph"]["0,0"]
         assert len(edges_00) == 1
         assert edges_00[0]["target"] == "0,1", "Target must be serialised as 'r,c' string"
         assert edges_00[0]["cost"] == pytest.approx(1.2346, abs=1e-4), (
@@ -1509,7 +1596,7 @@ class TestSaveGraphToJsonGaps:
 
         data = json.loads(open(json_path).read())
         assert data["nodes"] == {}
-        assert data["edges"] == {}
+        assert data["graph"] == {}
         assert data["metadata"]["nodes"] == 0
 
     def test_node_values_contain_lat_lon_not_max_speed(self, tmp_path):
@@ -1560,6 +1647,27 @@ class TestPrintRouteSummaryGaps:
         print_route_summary([{"lat": 53.0, "lon": 2.0}], "Single")
         out = capsys.readouterr().out
         assert "No data" in out
+
+
+class TestSaveRouteDetailedLogNoneWeather:
+    """Guard: save_route_detailed_log skips points where get_weather_from_cache returns None."""
+
+    def test_none_weather_point_is_skipped_without_crash(self, tmp_path, monkeypatch):
+        """After B-22 fix get_weather_from_cache can return None; log function must skip
+        those points rather than crashing with TypeError on w['wind_u']."""
+        import grib as grib_mod
+        monkeypatch.setattr(grib_mod, "get_weather_from_cache", lambda *a, **kw: None)
+        t0 = datetime(2026, 4, 20, 12, 0)
+        points = [
+            {"lat": 53.0, "lon": 2.0, "time": t0},
+            {"lat": 53.25, "lon": 2.25, "time": t0 + timedelta(hours=1)},
+        ]
+        log_path = str(tmp_path / "log.txt")
+        save_route_detailed_log(points, {}, log_path, "NoneWeather")
+        assert os.path.exists(log_path)
+        content = open(log_path).read()
+        data_rows = [l for l in content.splitlines() if l.strip().startswith("20")]
+        assert data_rows == [], "All points with None weather must be skipped"
 
 
 class TestSaveRouteDetailedLogGaps:
@@ -1664,6 +1772,168 @@ class TestPolarsGaps:
         polars = get_scampi_30_polars()
         result = polars([90, 30])[0]
         assert isinstance(result, (int, float, np.floating))
+
+
+class TestUKeyLowercaseFallback:
+    """B-22: get_weather_from_cache must return wind data even when the cache
+    uses the lowercase key '10 metre u wind component' instead of the uppercase
+    '10 metre U wind component' produced by some GRIB readers."""
+
+    def _make_lowercase_u_cache(self):
+        cache = make_weather_cache(u_speed=5.0, v_speed=0.0)
+        for dt in cache["data"]:
+            d = cache["data"][dt]
+            if "10 metre U wind component" in d:
+                d["10 metre u wind component"] = d.pop("10 metre U wind component")
+        return cache
+
+    def test_b22_get_weather_from_cache_with_lowercase_u_key_returns_wind_data(self):
+        """Core B-22 regression: get_weather_from_cache must not return None when
+        the cache contains only lowercase '10 metre u wind component'.
+
+        With the bug (no fallback), get_weather_from_cache returns None because
+        the key lookup fails silently — u is None → early return None.
+        After the fix the function tries the lowercase key and returns a dict
+        with 'wind_u' and 'wind_v'.
+        """
+        from grib import get_weather_from_cache
+        cache = self._make_lowercase_u_cache()
+        t0 = cache["dates"][0]
+        lats = cache["lats"]
+        lons = cache["lons"]
+        # lats/lons are 2D numpy arrays; grab a scalar from the middle
+        mid_r = lats.shape[0] // 2
+        mid_c = lons.shape[1] // 2
+        lat = float(lats[mid_r, mid_c])
+        lon = float(lons[mid_r, mid_c])
+
+        result = get_weather_from_cache(cache, lat, lon, t0)
+
+        assert result is not None, (
+            "B-22: get_weather_from_cache returned None for lowercase U key — "
+            "the case-insensitive fallback is missing"
+        )
+        assert "wind_u" in result, "B-22: result must contain 'wind_u'"
+        assert "wind_v" in result, "B-22: result must contain 'wind_v'"
+
+    def test_b22_get_weather_returns_wind_data_for_lowercase_v_key_also(self):
+        """B-22: get_weather_from_cache must handle lowercase V key too.
+
+        Constructs a cache where both U and V keys are lowercase, verifies that
+        get_weather_from_cache returns non-None with correct wind_u and wind_v.
+        Bug (no fallback for V): u found, v=None → returns None.
+        """
+        from grib import get_weather_from_cache
+        cache = make_weather_cache(u_speed=5.0, v_speed=3.0)
+        for dt in cache["data"]:
+            d = cache["data"][dt]
+            for old_key, new_key in [
+                ("10 metre U wind component", "10 metre u wind component"),
+                ("10 metre V wind component", "10 metre v wind component"),
+            ]:
+                if old_key in d:
+                    d[new_key] = d.pop(old_key)
+        t0 = cache["dates"][0]
+        lats, lons = cache["lats"], cache["lons"]
+        mid_r, mid_c = lats.shape[0] // 2, lons.shape[1] // 2
+        lat, lon = float(lats[mid_r, mid_c]), float(lons[mid_r, mid_c])
+
+        result = get_weather_from_cache(cache, lat, lon, t0)
+
+        assert result is not None, (
+            "B-22: get_weather_from_cache returned None for lowercase V key — "
+            "the V-key case-insensitive fallback is missing"
+        )
+        assert "wind_v" in result
+
+    def test_b22_get_weather_returns_none_when_both_keys_absent(self):
+        """B-22 boundary: get_weather_from_cache must return None when neither
+        uppercase nor lowercase key exists — not crash with KeyError."""
+        from grib import get_weather_from_cache
+        cache = make_weather_cache(u_speed=5.0, v_speed=0.0)
+        # Remove both U key variants entirely
+        for dt in cache["data"]:
+            d = cache["data"][dt]
+            d.pop("10 metre U wind component", None)
+            d.pop("10 metre u wind component", None)
+        t0 = cache["dates"][0]
+        lats, lons = cache["lats"], cache["lons"]
+        lat, lon = float(lats[0, 0]), float(lons[0, 0])
+
+        result = get_weather_from_cache(cache, lat, lon, t0)
+        assert result is None, (
+            "B-22: get_weather_from_cache must return None (not crash) "
+            "when both uppercase and lowercase U keys are absent"
+        )
+
+    def test_b22_get_weather_from_cache_with_lowercase_u_key_returns_wind_data(self):
+        """Core B-22 regression: get_weather_from_cache must not return None when
+        the cache contains only lowercase '10 metre u wind component'.
+
+        With the bug (no fallback), get_weather_from_cache returns None because
+        the key lookup fails silently — u is None → early return None.
+        After the fix the function tries the lowercase key and returns a dict
+        with 'wind_u' and 'wind_v'.
+        """
+        from grib import get_weather_from_cache
+        cache = self._make_lowercase_u_cache()
+        t0 = cache["dates"][0]
+        lats, lons = cache["lats"], cache["lons"]
+        mid_r, mid_c = lats.shape[0] // 2, lons.shape[1] // 2
+        lat, lon = float(lats[mid_r, mid_c]), float(lons[mid_r, mid_c])
+
+        result = get_weather_from_cache(cache, lat, lon, t0)
+
+        assert result is not None, (
+            "B-22: get_weather_from_cache returned None for lowercase U key — "
+            "the case-insensitive fallback is missing"
+        )
+        assert "wind_u" in result, "B-22: result must contain 'wind_u'"
+        assert "wind_v" in result, "B-22: result must contain 'wind_v'"
+
+    def test_b22_get_weather_returns_wind_data_for_lowercase_v_key_also(self):
+        """B-22: get_weather_from_cache must handle lowercase V key too."""
+        from grib import get_weather_from_cache
+        cache = make_weather_cache(u_speed=5.0, v_speed=3.0)
+        for dt in cache["data"]:
+            d = cache["data"][dt]
+            for old_key, new_key in [
+                ("10 metre U wind component", "10 metre u wind component"),
+                ("10 metre V wind component", "10 metre v wind component"),
+            ]:
+                if old_key in d:
+                    d[new_key] = d.pop(old_key)
+        t0 = cache["dates"][0]
+        lats, lons = cache["lats"], cache["lons"]
+        mid_r, mid_c = lats.shape[0] // 2, lons.shape[1] // 2
+        lat, lon = float(lats[mid_r, mid_c]), float(lons[mid_r, mid_c])
+
+        result = get_weather_from_cache(cache, lat, lon, t0)
+
+        assert result is not None, (
+            "B-22: get_weather_from_cache returned None for lowercase V key — "
+            "the V-key case-insensitive fallback is missing"
+        )
+        assert "wind_v" in result
+
+    def test_b22_get_weather_returns_none_when_both_keys_absent(self):
+        """B-22 boundary: get_weather_from_cache must return None when neither
+        uppercase nor lowercase key exists — not crash with KeyError."""
+        from grib import get_weather_from_cache
+        cache = make_weather_cache(u_speed=5.0, v_speed=0.0)
+        for dt in cache["data"]:
+            d = cache["data"][dt]
+            d.pop("10 metre U wind component", None)
+            d.pop("10 metre u wind component", None)
+        t0 = cache["dates"][0]
+        lats, lons = cache["lats"], cache["lons"]
+        lat, lon = float(lats[0, 0]), float(lons[0, 0])
+
+        result = get_weather_from_cache(cache, lat, lon, t0)
+        assert result is None, (
+            "B-22: get_weather_from_cache must return None (not crash) "
+            "when both uppercase and lowercase U keys are absent"
+        )
 
 
 class TestIOContractsUnit:
